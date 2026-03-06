@@ -9,6 +9,15 @@ log() {
   echo "[$(now_ts)] $*"
 }
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_FILE="${CONFIG_FILE:-${SCRIPT_DIR}/import.conf}"
+CONF_SOURCE="default-env"
+if [[ -f "$CONFIG_FILE" ]]; then
+  # shellcheck source=/dev/null
+  source "$CONFIG_FILE"
+  CONF_SOURCE="$CONFIG_FILE"
+fi
+
 usage() {
   cat >&2 <<'USAGE'
 usage: make_ovirt_ova.sh <vm-xml> [disk1] [disk2] ...
@@ -42,8 +51,8 @@ DISK_INPUTS=("$@")
 RAW_BASE_DIR="${RAW_BASE_DIR:-/data/v2v}"
 OVA_BASE_DIR="${OVA_BASE_DIR:-/data/ova}"
 ENGINE_VSYSTEM_TYPE="${ENGINE_VSYSTEM_TYPE:-ENGINE 4.1.0.0}"
-GENERATE_MANIFEST=0
-USE_TAR_SPARSE=1
+GENERATE_MANIFEST="${GENERATE_MANIFEST:-0}"
+USE_TAR_SPARSE="${USE_TAR_SPARSE:-1}"
 TAR_PROGRESS_INTERVAL="${TAR_PROGRESS_INTERVAL:-5}"
 
 RAW_OVF_FORMAT_URI="http://en.wikipedia.org/wiki/Byte"
@@ -101,7 +110,7 @@ STAGING_DIR="${OVA_BASE_DIR%/}/${vm_name}/ova-staging/${vm_name}"
 mkdir -p "$STAGING_DIR"
 mkdir -p "$(dirname "$OUT_OVA")"
 
-log "START make_ovirt_ova vm=${vm_name} xml=${XML_PATH}"
+log "START make_ovirt_ova vm=${vm_name} xml=${XML_PATH} config=${CONF_SOURCE}"
 
 ovf_file="${STAGING_DIR%/}/${vm_name}.ovf"
 mf_file="${STAGING_DIR%/}/${vm_name}.mf"

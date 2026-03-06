@@ -9,6 +9,15 @@ log() {
   echo "[$(now_ts)] $*"
 }
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_FILE="${CONFIG_FILE:-${SCRIPT_DIR}/import.conf}"
+CONF_SOURCE="default-env"
+if [[ -f "$CONFIG_FILE" ]]; then
+  # shellcheck source=/dev/null
+  source "$CONFIG_FILE"
+  CONF_SOURCE="$CONFIG_FILE"
+fi
+
 usage() {
   cat >&2 <<'EOF'
 usage: convert_disks_from_xml.sh <vm-xml>
@@ -22,7 +31,7 @@ Fixed paths:
   images output  : ${RAW_BASE_DIR:-/data/v2v}/<vm-name>/images (qcow2)
   disk logs      : ${RAW_BASE_DIR:-/data/v2v}/<vm-name>/logs/qemu
 
-Tune values by editing this script:
+Tune values via conf/env:
   MAX_JOBS, INPUT_FORMAT, OUTPUT_FORMAT, OUTPUT_OPTIONS,
   SPARSE_SIZE, COROUTINES, CACHE_MODE, SRC_CACHE_MODE
 EOF
@@ -36,14 +45,14 @@ fi
 XML_PATH="$1"
 RAW_BASE_DIR="${RAW_BASE_DIR:-/data/v2v}"
 
-MAX_JOBS=4
-INPUT_FORMAT="raw"
-OUTPUT_FORMAT="qcow2"
-OUTPUT_OPTIONS="compat=1.1,lazy_refcounts=off,cluster_size=65536"
-SPARSE_SIZE=""
-COROUTINES="8"
-CACHE_MODE="writeback"
-SRC_CACHE_MODE="none"
+MAX_JOBS="${MAX_JOBS:-4}"
+INPUT_FORMAT="${INPUT_FORMAT:-raw}"
+OUTPUT_FORMAT="${OUTPUT_FORMAT:-qcow2}"
+OUTPUT_OPTIONS="${OUTPUT_OPTIONS:-compat=1.1,lazy_refcounts=off,cluster_size=65536}"
+SPARSE_SIZE="${SPARSE_SIZE:-}"
+COROUTINES="${COROUTINES:-8}"
+CACHE_MODE="${CACHE_MODE:-writeback}"
+SRC_CACHE_MODE="${SRC_CACHE_MODE:-none}"
 
 if [[ ! -f "$XML_PATH" ]]; then
   echo "error: xml not found: $XML_PATH" >&2
@@ -81,7 +90,7 @@ OUT_DIR="${RAW_BASE_DIR%/}/${vm_name}/images"
 LOG_DIR="${RAW_BASE_DIR%/}/${vm_name}/logs/qemu"
 mkdir -p "$OUT_DIR" "$LOG_DIR"
 
-log "START convert_disks_from_xml xml=${XML_PATH} vm=${vm_name}"
+log "START convert_disks_from_xml xml=${XML_PATH} vm=${vm_name} config=${CONF_SOURCE}"
 
 disk_lines=$(
   awk '
