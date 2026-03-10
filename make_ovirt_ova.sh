@@ -1,22 +1,29 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-now_ts() {
-  date '+%F %T'
-}
-
-log() {
-  echo "[$(now_ts)] $*"
-}
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG_FILE="${CONFIG_FILE:-${SCRIPT_DIR}/import.conf}"
-CONF_SOURCE="default-env"
-if [[ -f "$CONFIG_FILE" ]]; then
-  # shellcheck source=/dev/null
-  source "$CONFIG_FILE"
-  CONF_SOURCE="$CONFIG_FILE"
+COMMON_ENV_FILE="${COMMON_ENV_FILE:-${SCRIPT_DIR}/common.env}"
+if [[ ! -f "$COMMON_ENV_FILE" ]]; then
+  echo "error: common library not found: $COMMON_ENV_FILE" >&2
+  exit 1
 fi
+# shellcheck source=/dev/null
+source "$COMMON_ENV_FILE"
+
+if [[ -z "${CONFIG_FILE:-}" ]]; then
+  CONFIG_FILE="${SCRIPT_DIR}/v2v.conf"
+fi
+declare -a PRESERVE_ENV_KEYS=(
+  DATA_BASE_DIR V2V_BASE_DIR V2V_LOG_BASE_DIR QEMU_BASE_DIR RAW_BASE_DIR
+  OVA_OUTPUT_DIR OVA_BASE_DIR OVA_STAGING_BASE_DIR
+  ENGINE_VSYSTEM_TYPE GENERATE_MANIFEST USE_TAR_SPARSE TAR_PROGRESS_INTERVAL
+  SCRIPT_LOG_ENABLE MAKE_OVA_LOG_ENABLE
+  FORCE_OVF_DISK_FORMAT_URI OVF_DISK_FORMAT_URI
+  FORCE_OVF_VOLUME_FORMAT OVF_VOLUME_FORMAT
+  FORCE_OVF_VOLUME_TYPE OVF_VOLUME_TYPE
+  FORCE_BOOT_DISK_INDEX RUN_LOG_DIR
+)
+CONF_SOURCE="$(v2v_load_config_with_env "$CONFIG_FILE" "${PRESERVE_ENV_KEYS[@]}")"
 
 usage() {
   cat >&2 <<'USAGE'
@@ -27,10 +34,10 @@ This script does not run qemu-img convert.
 
 Fixed paths:
   XML          : <vm-xml input>
-  output OVA   : ${OVA_BASE_DIR:-/data/ova}/<vm-name>/<vm-name>.ova
+  output OVA   : ${OVA_OUTPUT_DIR:-/data/v2v/ova}/<vm-name>.ova
 
 When disk args are omitted:
-  - auto load from ${RAW_BASE_DIR:-/data/v2v}/<vm-name>/images/<vm-name>-disk*.qcow2
+  - auto load from ${QEMU_BASE_DIR:-/data/v2v/qemu}/<vm-name>/<vm-name>-disk*.qcow2
 
 Compatibility defaults:
   - ovf:format / ovf:volume-format / ovf:volume-type are auto-selected per disk format
@@ -48,12 +55,26 @@ shift
 DISK_INPUTS=("$@")
 
 # Keep RAW_BASE_DIR name for backward compatibility with existing usage.
-RAW_BASE_DIR="${RAW_BASE_DIR:-/data/v2v}"
-OVA_BASE_DIR="${OVA_BASE_DIR:-/data/ova}"
+if [[ -z "${V2V_BASE_DIR+x}" && -n "${DATA_BASE_DIR+x}" ]]; then
+  V2V_BASE_DIR="${DATA_BASE_DIR%/}/v2v"
+fi
+if [[ -z "${QEMU_BASE_DIR+x}" && -n "${RAW_BASE_DIR+x}" ]]; then
+  QEMU_BASE_DIR="$RAW_BASE_DIR"
+fi
+if [[ -z "${OVA_OUTPUT_DIR+x}" && -n "${OVA_BASE_DIR+x}" ]]; then
+  OVA_OUTPUT_DIR="$OVA_BASE_DIR"
+fi
+V2V_BASE_DIR="${V2V_BASE_DIR:-/data/v2v}"
+V2V_LOG_BASE_DIR="${V2V_LOG_BASE_DIR:-/data/v2v_log}"
+QEMU_BASE_DIR="${QEMU_BASE_DIR:-${V2V_BASE_DIR%/}/qemu}"
+OVA_OUTPUT_DIR="${OVA_OUTPUT_DIR:-${V2V_BASE_DIR%/}/ova}"
+OVA_STAGING_BASE_DIR="${OVA_STAGING_BASE_DIR:-${OVA_OUTPUT_DIR%/}/ova_stag}"
 ENGINE_VSYSTEM_TYPE="${ENGINE_VSYSTEM_TYPE:-ENGINE 4.1.0.0}"
 GENERATE_MANIFEST="${GENERATE_MANIFEST:-0}"
 USE_TAR_SPARSE="${USE_TAR_SPARSE:-1}"
 TAR_PROGRESS_INTERVAL="${TAR_PROGRESS_INTERVAL:-5}"
+SCRIPT_LOG_ENABLE="${SCRIPT_LOG_ENABLE:-1}"
+MAKE_OVA_LOG_ENABLE="${MAKE_OVA_LOG_ENABLE:-$SCRIPT_LOG_ENABLE}"
 
 RAW_OVF_FORMAT_URI="http://en.wikipedia.org/wiki/Byte"
 QCOW2_OVF_FORMAT_URI="http://www.gnome.org/~markmc/qcow-image-format.html"
@@ -92,8 +113,18 @@ if [[ -z "$vm_name" ]]; then
   exit 1
 fi
 
+SCRIPT_LOG_DIR="${V2V_LOG_BASE_DIR%/}/${vm_name}"
+if [[ -n "${RUN_LOG_DIR:-}" ]]; then
+  SCRIPT_LOG_DIR="$RUN_LOG_DIR"
+fi
+SCRIPT_LOG_FILE="${SCRIPT_LOG_DIR%/}/make_ovirt_ova-$(date +%F_%H%M%S).log"
+mkdir -p "$SCRIPT_LOG_DIR"
+if is_enabled "$MAKE_OVA_LOG_ENABLE"; then
+  exec > >(tee -a "$SCRIPT_LOG_FILE") 2>&1
+fi
+
 if [[ ${#DISK_INPUTS[@]} -eq 0 ]]; then
-  auto_dir="${RAW_BASE_DIR%/}/${vm_name}/images"
+  auto_dir="${QEMU_BASE_DIR%/}/${vm_name}"
   shopt -s nullglob
   DISK_INPUTS=( "${auto_dir}/${vm_name}-disk"*.qcow2 )
   shopt -u nullglob
@@ -101,16 +132,19 @@ fi
 
 if [[ ${#DISK_INPUTS[@]} -eq 0 ]]; then
   echo "error: no disk input files" >&2
-  echo "hint : pass disk files or put qcow2 files under ${RAW_BASE_DIR%/}/${vm_name}/images" >&2
+  echo "hint : pass disk files or put qcow2 files under ${QEMU_BASE_DIR%/}/${vm_name}" >&2
   exit 1
 fi
 
-OUT_OVA="${OVA_BASE_DIR%/}/${vm_name}/${vm_name}.ova"
-STAGING_DIR="${OVA_BASE_DIR%/}/${vm_name}/ova-staging/${vm_name}"
+OUT_OVA="${OVA_OUTPUT_DIR%/}/${vm_name}.ova"
+STAGING_DIR="${OVA_STAGING_BASE_DIR%/}/${vm_name}"
 mkdir -p "$STAGING_DIR"
 mkdir -p "$(dirname "$OUT_OVA")"
 
 log "START make_ovirt_ova vm=${vm_name} xml=${XML_PATH} config=${CONF_SOURCE}"
+if is_enabled "$MAKE_OVA_LOG_ENABLE"; then
+  log "script log : $SCRIPT_LOG_FILE"
+fi
 
 ovf_file="${STAGING_DIR%/}/${vm_name}.ovf"
 mf_file="${STAGING_DIR%/}/${vm_name}.mf"
@@ -192,7 +226,7 @@ ovf_disk_interface_for_bus() {
   local bus="$1"
   case "$bus" in
     virtio) echo "VirtIO" ;;
-    scsi) echo "VirtIO_SCSI" ;;
+    scsi|virtio-scsi|virtio_scsi) echo "VirtIO_SCSI" ;;
     ide) echo "IDE" ;;
     sata) echo "SATA" ;;
     *) echo "VirtIO" ;;
@@ -436,6 +470,8 @@ declare -a SRC_FORMATS=()
 declare -a OVF_FORMAT_URIS=()
 declare -a OVF_VOLUME_FORMATS=()
 declare -a OVF_VOLUME_TYPES=()
+HAS_VIRTIO_SCSI=0
+SCSI_CONTROLLER_INSTANCE_ID=""
 
 for i in "${!DISK_INPUTS[@]}"; do
   idx=$((i + 1))
@@ -453,7 +489,11 @@ for i in "${!DISK_INPUTS[@]}"; do
   staged_path="${STAGING_DIR%/}/${staged_name}"
 
   rm -f "$staged_path"
-  if ! ln "$src_path" "$staged_path" 2>/dev/null; then
+  log "stage disk${idx}: src=${src_path} staged=${staged_path}"
+  if ln "$src_path" "$staged_path" 2>/dev/null; then
+    log "cmd         : ln ${src_path} ${staged_path} (hardlink)"
+  else
+    log "cmd         : cp -f ${src_path} ${staged_path} (fallback copy)"
     cp -f "$src_path" "$staged_path"
   fi
 
@@ -530,6 +570,14 @@ if (( ${#XML_TARGET_DEVS[@]} != 0 && ${#XML_TARGET_DEVS[@]} != ${#SRC_PATHS[@]} 
   echo "warn: xml disk count (${#XML_TARGET_DEVS[@]}) != disk input count (${#SRC_PATHS[@]})" >&2
 fi
 
+for i in "${!DISK_INTERFACES[@]}"; do
+  if [[ "${DISK_INTERFACES[$i]}" == "VirtIO_SCSI" ]]; then
+    HAS_VIRTIO_SCSI=1
+    SCSI_CONTROLLER_INSTANCE_ID="$(gen_uuid)"
+    break
+  fi
+done
+
 log "vm          : $vm_name"
 log "vcpu/memory : ${vcpu_count} / ${memory_mb} MiB"
 log "disk count  : ${#SRC_PATHS[@]}"
@@ -550,6 +598,9 @@ for i in "${!SRC_PATHS[@]}"; do
   idx=$((i + 1))
   log "${DISK_ALIASES[$i]} : target=${TARGET_DEVS[$i]} iface=${DISK_INTERFACES[$i]} boot=${BOOT_FLAGS[$i]} srcfmt=${SRC_FORMATS[$i]} ovf=${OVF_FORMAT_URIS[$i]} file=${SRC_PATHS[$i]} staged=${STAGED_NAMES[$i]}"
 done
+if (( HAS_VIRTIO_SCSI == 1 )); then
+  log "controller   : virtio-scsi enabled (instance-id=${SCSI_CONTROLLER_INSTANCE_ID})"
+fi
 
 virtual_system_id="$(gen_uuid)"
 
@@ -621,14 +672,30 @@ OVF
       </Item>
 OVF
 
+  if (( HAS_VIRTIO_SCSI == 1 )); then
+    cat <<OVF
+      <Item>
+        <rasd:Caption>VirtIO SCSI Controller</rasd:Caption>
+        <rasd:Description>SCSI Controller</rasd:Description>
+        <rasd:InstanceId>${SCSI_CONTROLLER_INSTANCE_ID}</rasd:InstanceId>
+        <rasd:ResourceType>6</rasd:ResourceType>
+        <rasd:ResourceSubType>virtio-scsi</rasd:ResourceSubType>
+      </Item>
+OVF
+  fi
+
   for i in "${!DISK_IDS[@]}"; do
+    disk_parent="00000000-0000-0000-0000-000000000000"
+    if (( HAS_VIRTIO_SCSI == 1 )) && [[ "${DISK_INTERFACES[$i]}" == "VirtIO_SCSI" ]]; then
+      disk_parent="$SCSI_CONTROLLER_INSTANCE_ID"
+    fi
     printf '%s\n' \
 '      <Item>' \
 "        <rasd:Caption>${DISK_ALIASES[$i]}</rasd:Caption>" \
 "        <rasd:InstanceId>${FILE_IDS[$i]}</rasd:InstanceId>" \
 '        <rasd:ResourceType>17</rasd:ResourceType>' \
 "        <rasd:HostResource>ovf:/disk/${DISK_IDS[$i]}</rasd:HostResource>" \
-'        <rasd:Parent>00000000-0000-0000-0000-000000000000</rasd:Parent>' \
+"        <rasd:Parent>${disk_parent}</rasd:Parent>" \
 '        <Type>disk</Type>' \
 '        <Device>disk</Device>' \
 "        <BootOrder>${ITEM_BOOT_ORDERS[$i]}</BootOrder>" \
@@ -671,6 +738,8 @@ fi
 for staged_name in "${STAGED_NAMES[@]}"; do
   tar_cmd+=( -C "$STAGING_DIR" "$staged_name" )
 done
+printf -v tar_cmd_q '%q ' "${tar_cmd[@]}"
+log "cmd         : ${tar_cmd_q% }"
 
 estimated_total="$(filesize_bytes "$ovf_file")"
 if (( GENERATE_MANIFEST == 1 )); then
