@@ -219,7 +219,6 @@ if not disks:
     raise SystemExit(1)
 
 mapped = []
-scsi_disk_count = 0
 for idx, disk in enumerate(disks, start=1):
     disk_file = pick_disk_file(idx)
     if not disk_file:
@@ -253,42 +252,10 @@ for idx, disk in enumerate(disks, start=1):
     driver_elem.set("name", "qemu")
     driver_elem.set("type", fmt)
 
-    target_elem = None
-    for ch in list(disk):
-        if local_name(ch.tag) == "target":
-            target_elem = ch
-            break
-    if target_elem is not None:
-        bus = (target_elem.attrib.get("bus") or "").strip().lower()
-        if bus == "scsi":
-            scsi_disk_count += 1
-
     mapped.append((idx, disk_file, fmt))
 
-scsi_controller_added = False
-if scsi_disk_count > 0:
-    has_virtio_scsi_controller = False
-    for ctrl in find_children(devices, "controller"):
-        ctype = (ctrl.attrib.get("type") or "").strip().lower()
-        cmodel = (ctrl.attrib.get("model") or "").strip().lower()
-        if ctype == "scsi" and ("virtio" in cmodel or cmodel == ""):
-            has_virtio_scsi_controller = True
-            if cmodel == "":
-                ctrl.set("model", "virtio-scsi")
-            break
-    if not has_virtio_scsi_controller:
-        ctrl = ET.Element("controller")
-        ctrl.set("type", "scsi")
-        ctrl.set("index", "0")
-        ctrl.set("model", "virtio-scsi")
-        devices.insert(0, ctrl)
-        scsi_controller_added = True
-
 tree.write(runtime_xml, encoding="utf-8", xml_declaration=True)
-print(
-    f"OK: wrote {runtime_xml} "
-    f"(disks={len(mapped)}, scsi_disks={scsi_disk_count}, scsi_controller_added={str(scsi_controller_added).lower()})"
-)
+print(f"OK: wrote {runtime_xml} (disks={len(mapped)})")
 for idx, path, fmt in mapped:
     print(f"disk{idx}: {path} fmt={fmt}")
 PY

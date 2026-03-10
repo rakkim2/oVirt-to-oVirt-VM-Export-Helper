@@ -470,8 +470,6 @@ declare -a SRC_FORMATS=()
 declare -a OVF_FORMAT_URIS=()
 declare -a OVF_VOLUME_FORMATS=()
 declare -a OVF_VOLUME_TYPES=()
-HAS_VIRTIO_SCSI=0
-SCSI_CONTROLLER_INSTANCE_ID=""
 
 for i in "${!DISK_INPUTS[@]}"; do
   idx=$((i + 1))
@@ -570,14 +568,6 @@ if (( ${#XML_TARGET_DEVS[@]} != 0 && ${#XML_TARGET_DEVS[@]} != ${#SRC_PATHS[@]} 
   echo "warn: xml disk count (${#XML_TARGET_DEVS[@]}) != disk input count (${#SRC_PATHS[@]})" >&2
 fi
 
-for i in "${!DISK_INTERFACES[@]}"; do
-  if [[ "${DISK_INTERFACES[$i]}" == "VirtIO_SCSI" ]]; then
-    HAS_VIRTIO_SCSI=1
-    SCSI_CONTROLLER_INSTANCE_ID="$(gen_uuid)"
-    break
-  fi
-done
-
 log "vm          : $vm_name"
 log "vcpu/memory : ${vcpu_count} / ${memory_mb} MiB"
 log "disk count  : ${#SRC_PATHS[@]}"
@@ -598,9 +588,6 @@ for i in "${!SRC_PATHS[@]}"; do
   idx=$((i + 1))
   log "${DISK_ALIASES[$i]} : target=${TARGET_DEVS[$i]} iface=${DISK_INTERFACES[$i]} boot=${BOOT_FLAGS[$i]} srcfmt=${SRC_FORMATS[$i]} ovf=${OVF_FORMAT_URIS[$i]} file=${SRC_PATHS[$i]} staged=${STAGED_NAMES[$i]}"
 done
-if (( HAS_VIRTIO_SCSI == 1 )); then
-  log "controller   : virtio-scsi enabled (instance-id=${SCSI_CONTROLLER_INSTANCE_ID})"
-fi
 
 virtual_system_id="$(gen_uuid)"
 
@@ -672,30 +659,14 @@ OVF
       </Item>
 OVF
 
-  if (( HAS_VIRTIO_SCSI == 1 )); then
-    cat <<OVF
-      <Item>
-        <rasd:Caption>VirtIO SCSI Controller</rasd:Caption>
-        <rasd:Description>SCSI Controller</rasd:Description>
-        <rasd:InstanceId>${SCSI_CONTROLLER_INSTANCE_ID}</rasd:InstanceId>
-        <rasd:ResourceType>6</rasd:ResourceType>
-        <rasd:ResourceSubType>virtio-scsi</rasd:ResourceSubType>
-      </Item>
-OVF
-  fi
-
   for i in "${!DISK_IDS[@]}"; do
-    disk_parent="00000000-0000-0000-0000-000000000000"
-    if (( HAS_VIRTIO_SCSI == 1 )) && [[ "${DISK_INTERFACES[$i]}" == "VirtIO_SCSI" ]]; then
-      disk_parent="$SCSI_CONTROLLER_INSTANCE_ID"
-    fi
     printf '%s\n' \
 '      <Item>' \
 "        <rasd:Caption>${DISK_ALIASES[$i]}</rasd:Caption>" \
 "        <rasd:InstanceId>${FILE_IDS[$i]}</rasd:InstanceId>" \
 '        <rasd:ResourceType>17</rasd:ResourceType>' \
 "        <rasd:HostResource>ovf:/disk/${DISK_IDS[$i]}</rasd:HostResource>" \
-"        <rasd:Parent>${disk_parent}</rasd:Parent>" \
+'        <rasd:Parent>00000000-0000-0000-0000-000000000000</rasd:Parent>' \
 '        <Type>disk</Type>' \
 '        <Device>disk</Device>' \
 "        <BootOrder>${ITEM_BOOT_ORDERS[$i]}</BootOrder>" \
