@@ -1,5 +1,9 @@
 # OLV (oVirt) VM Export Helper (XML -> qemu -> OVA)
 
+> 중요: 이 문서는 **Export 전용(Stable-1)** 기준입니다.  
+> 이 스크립트는 **XML 생성 + 디스크 변환 + OVA 패키징**까지만 수행합니다.  
+> **Import는 oVirt UI에서 수동으로** 진행해야 합니다.
+
 이 문서는 oVirt VM to oVirt VM을 수행하는 `make_v2v_xml.sh`, `run_qemu_ova_pipeline.sh` 기준 사용법입니다.  
 기본 실행 위치는 스크립트가 있는 디렉터리(예: `/root/v2v`)입니다.
 
