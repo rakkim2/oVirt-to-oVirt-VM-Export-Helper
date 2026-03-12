@@ -9,6 +9,15 @@ log() {
   echo "[$(now_ts)] $*"
 }
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_FILE="${CONFIG_FILE:-${SCRIPT_DIR}/import.conf}"
+CONF_SOURCE="default-env"
+if [[ -f "$CONFIG_FILE" ]]; then
+  # shellcheck source=/dev/null
+  source "$CONFIG_FILE"
+  CONF_SOURCE="$CONFIG_FILE"
+fi
+
 usage() {
   cat >&2 <<'EOF'
 usage: toggle_lv_from_xml.sh <vm-xml> [up|down|status]
@@ -65,7 +74,7 @@ if [[ ! "$SET_PERM_ON_ACTIVE_LV" =~ ^[01]$ ]]; then
   exit 1
 fi
 
-log "START toggle_lv_from_xml xml=${XML_PATH} action=${ACTION}"
+log "START toggle_lv_from_xml xml=${XML_PATH} action=${ACTION} config=${CONF_SOURCE}"
 
 declare -a LV_LIST=()
 lv_already_added() {

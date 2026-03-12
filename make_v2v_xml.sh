@@ -9,13 +9,22 @@ log() {
   echo "[$(now_ts)] $*"
 }
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_FILE="${CONFIG_FILE:-${SCRIPT_DIR}/import.conf}"
+CONF_SOURCE="default-env"
+if [[ -f "$CONFIG_FILE" ]]; then
+  # shellcheck source=/dev/null
+  source "$CONFIG_FILE"
+  CONF_SOURCE="$CONFIG_FILE"
+fi
+
 if [[ $# -ne 1 ]]; then
   echo "usage: $0 <vm-name>" >&2
   exit 1
 fi
 
 VM_NAME="$1"
-OUT_DIR="./xml"
+OUT_DIR="${XML_OUT_DIR:-/data/v2v/xml}"
 CONN_URI="${LIBVIRT_URI:-qemu:///system}"
 # 1: convert blockSD source path to /dev/<SD_UUID>/<VOL_UUID> in output XML
 # 0: keep original /rhev/data-center/mnt/blockSD/.../images/... path
@@ -31,7 +40,7 @@ OUT_XML="${OUT_DIR%/}/${VM_NAME}.xml"
 TMP_XML=$(mktemp)
 trap 'rm -f "$TMP_XML"' EXIT
 
-log "START make_v2v_xml vm=${VM_NAME} uri=${CONN_URI} output=${OUT_XML}"
+log "START make_v2v_xml vm=${VM_NAME} uri=${CONN_URI} output=${OUT_XML} config=${CONF_SOURCE}"
 
 virsh -r -c "$CONN_URI" dumpxml "$VM_NAME" > "$TMP_XML"
 

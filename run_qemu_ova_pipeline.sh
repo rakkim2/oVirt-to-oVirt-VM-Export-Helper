@@ -9,6 +9,15 @@ log() {
   echo "[$(now_ts)] $*"
 }
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_FILE="${CONFIG_FILE:-${SCRIPT_DIR}/import.conf}"
+CONF_SOURCE="default-env"
+if [[ -f "$CONFIG_FILE" ]]; then
+  # shellcheck source=/dev/null
+  source "$CONFIG_FILE"
+  CONF_SOURCE="$CONFIG_FILE"
+fi
+
 usage() {
   cat >&2 <<'EOF'
 usage: run_qemu_ova_pipeline.sh <vm-xml>
@@ -69,13 +78,12 @@ if [[ "$PIPELINE_LOG_ENABLE" == "1" ]]; then
   exec > >(tee -a "$PIPELINE_LOG_FILE") 2>&1
 fi
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IMG_DIR="${RAW_VM_DIR%/}/images"
 OVA_PATH="${OVA_BASE_DIR%/}/${VM_NAME}/${VM_NAME}.ova"
 
 mkdir -p "$IMG_DIR"
 
-log "START run_qemu_ova_pipeline xml=${XML_PATH}"
+log "START run_qemu_ova_pipeline xml=${XML_PATH} config=${CONF_SOURCE}"
 if [[ "$PIPELINE_LOG_ENABLE" == "1" ]]; then
   log "pipeline log : $PIPELINE_LOG_FILE"
 fi
