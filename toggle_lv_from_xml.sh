@@ -1,22 +1,29 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-now_ts() {
-  date '+%F %T'
-}
-
-log() {
-  echo "[$(now_ts)] $*"
+cmd_q() {
+  local rendered
+  printf -v rendered '%q ' "$@"
+  echo "${rendered% }"
 }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG_FILE="${CONFIG_FILE:-${SCRIPT_DIR}/import.conf}"
-CONF_SOURCE="default-env"
-if [[ -f "$CONFIG_FILE" ]]; then
-  # shellcheck source=/dev/null
-  source "$CONFIG_FILE"
-  CONF_SOURCE="$CONFIG_FILE"
+COMMON_ENV_FILE="${COMMON_ENV_FILE:-${SCRIPT_DIR}/common.env}"
+if [[ ! -f "$COMMON_ENV_FILE" ]]; then
+  echo "error: common library not found: $COMMON_ENV_FILE" >&2
+  exit 1
 fi
+# shellcheck source=/dev/null
+source "$COMMON_ENV_FILE"
+
+if [[ -z "${CONFIG_FILE:-}" ]]; then
+  CONFIG_FILE="${SCRIPT_DIR}/v2v.conf"
+fi
+declare -a PRESERVE_ENV_KEYS=(
+  V2V_LOG_BASE_DIR SCRIPT_LOG_ENABLE TOGGLE_LV_LOG_ENABLE RUN_LOG_DIR
+  UP_MODE SET_PERM_ON_ACTIVE_LV DEACTIVATE_RETRY_COUNT DEACTIVATE_RETRY_SLEEP
+)
+CONF_SOURCE="$(v2v_load_config_with_env "$CONFIG_FILE" "${PRESERVE_ENV_KEYS[@]}")"
 
 usage() {
   cat >&2 <<'EOF'
@@ -53,6 +60,34 @@ if [[ ! -f "$XML_PATH" ]]; then
   exit 1
 fi
 
+V2V_LOG_BASE_DIR="${V2V_LOG_BASE_DIR:-/data/v2v_log}"
+SCRIPT_LOG_ENABLE="${SCRIPT_LOG_ENABLE:-1}"
+TOGGLE_LV_LOG_ENABLE="${TOGGLE_LV_LOG_ENABLE:-$SCRIPT_LOG_ENABLE}"
+VM_NAME="$(
+  awk '
+  function text_between(s, open_tag, close_tag,    t) {
+    t = s
+    sub("^.*<" open_tag "[^>]*>", "", t)
+    sub("</" close_tag ">.*$", "", t)
+    return t
+  }
+  /^[[:space:]]*<name>/ { print text_between($0, "name", "name"); exit }
+  ' "$XML_PATH"
+)"
+if [[ -z "$VM_NAME" ]]; then
+  VM_NAME="$(basename "$XML_PATH" .xml)"
+fi
+SCRIPT_LOG_DIR="${V2V_LOG_BASE_DIR%/}/${VM_NAME}"
+if [[ -n "${RUN_LOG_DIR:-}" ]]; then
+  SCRIPT_LOG_DIR="$RUN_LOG_DIR"
+fi
+SCRIPT_LOG_FILE="${SCRIPT_LOG_DIR%/}/toggle_lv_from_xml-${ACTION}-$(date +%F_%H%M%S).log"
+
+mkdir -p "$SCRIPT_LOG_DIR"
+if is_enabled "$TOGGLE_LV_LOG_ENABLE"; then
+  exec > >(tee -a "$SCRIPT_LOG_FILE") 2>&1
+fi
+
 if ! command -v lvchange >/dev/null 2>&1; then
   echo "error: lvchange not found" >&2
   exit 1
@@ -60,6 +95,8 @@ fi
 
 UP_MODE="${UP_MODE:-ro}"
 SET_PERM_ON_ACTIVE_LV="${SET_PERM_ON_ACTIVE_LV:-0}"
+DEACTIVATE_RETRY_COUNT="${DEACTIVATE_RETRY_COUNT:-5}"
+DEACTIVATE_RETRY_SLEEP="${DEACTIVATE_RETRY_SLEEP:-1}"
 
 case "$UP_MODE" in
   ro|rw) ;;
@@ -74,7 +111,20 @@ if [[ ! "$SET_PERM_ON_ACTIVE_LV" =~ ^[01]$ ]]; then
   exit 1
 fi
 
+if [[ ! "$DEACTIVATE_RETRY_COUNT" =~ ^[0-9]+$ ]] || (( DEACTIVATE_RETRY_COUNT < 1 )); then
+  echo "error: DEACTIVATE_RETRY_COUNT must be integer >= 1 (current: $DEACTIVATE_RETRY_COUNT)" >&2
+  exit 1
+fi
+
+if [[ ! "$DEACTIVATE_RETRY_SLEEP" =~ ^[0-9]+$ ]]; then
+  echo "error: DEACTIVATE_RETRY_SLEEP must be integer >= 0 (current: $DEACTIVATE_RETRY_SLEEP)" >&2
+  exit 1
+fi
+
 log "START toggle_lv_from_xml xml=${XML_PATH} action=${ACTION} config=${CONF_SOURCE}"
+if is_enabled "$TOGGLE_LV_LOG_ENABLE"; then
+  log "script log : $SCRIPT_LOG_FILE"
+fi
 
 declare -a LV_LIST=()
 lv_already_added() {
@@ -192,12 +242,14 @@ set_lv_permission() {
     cmd=(lvchange -p rw "$item")
   fi
 
+  log "  cmd: $(cmd_q "${cmd[@]}")"
   set +e
   out="$("${cmd[@]}" 2>&1)"
   rc=$?
   set -e
 
   if (( rc == 0 )); then
+    log "  rc : 0 (${item})"
     return 0
   fi
 
@@ -235,12 +287,14 @@ activate_lv() {
     return 1
   fi
 
+  log "  cmd: $(cmd_q "${cmd[@]}")"
   set +e
   out="$("${cmd[@]}" 2>&1)"
   rc=$?
   set -e
 
   if (( rc == 0 )); then
+    log "  rc : 0 (${item})"
     return 0
   fi
 
@@ -251,6 +305,53 @@ activate_lv() {
 
   echo "  error: lvchange -ay failed: $item" >&2
   [[ -n "$out" ]] && echo "  detail: $out" >&2
+  return 1
+}
+
+deactivate_lv() {
+  local item="$1"
+  local cmd=()
+  local cmd_text=""
+  local out=""
+  local rc=0
+  local state_after=""
+  local attempt=0
+  local attr_after=""
+
+  for (( attempt = 1; attempt <= DEACTIVATE_RETRY_COUNT; attempt++ )); do
+    cmd=(lvchange -an "$item")
+    cmd_text="$(cmd_q "${cmd[@]}")"
+    log "  cmd: ${cmd_text} (attempt ${attempt}/${DEACTIVATE_RETRY_COUNT})"
+    set +e
+    out="$("${cmd[@]}" 2>&1)"
+    rc=$?
+    set -e
+
+    state_after="$(get_lv_state "$item")"
+    if (( rc == 0 )) || ! is_active_state "$state_after"; then
+      if ! set_lv_permission "$item" rw; then
+        echo "  error: lv deactivated but failed to set rw permission: $item" >&2
+        return 1
+      fi
+      log "  rc : ${rc} (${item})"
+      return 0
+    fi
+
+    if (( attempt < DEACTIVATE_RETRY_COUNT )); then
+      echo "  warn: deactivate retry ${attempt}/${DEACTIVATE_RETRY_COUNT} failed: $item" >&2
+      [[ -n "$out" ]] && echo "  detail: $out" >&2
+      if (( DEACTIVATE_RETRY_SLEEP > 0 )); then
+        sleep "$DEACTIVATE_RETRY_SLEEP"
+      fi
+    fi
+  done
+
+  echo "  error: failed to deactivate lv after ${DEACTIVATE_RETRY_COUNT} attempts: $item" >&2
+  [[ -n "$out" ]] && echo "  detail: $out" >&2
+  attr_after="$(get_lv_attr "$item")"
+  if [[ -n "$attr_after" ]]; then
+    echo "  detail: current lv_attr=${attr_after}" >&2
+  fi
   return 1
 }
 
@@ -328,8 +429,14 @@ log "action: $ACTION"
 if [[ "$ACTION" == "up" ]]; then
   log "up mode: $UP_MODE"
   log "set perm on active lv: $SET_PERM_ON_ACTIVE_LV"
+else
+  log "deactivate retry count: $DEACTIVATE_RETRY_COUNT"
+  log "deactivate retry sleep: ${DEACTIVATE_RETRY_SLEEP}s"
 fi
 log "lv count: $lv_count"
+for item in "${LV_LIST[@]-}"; do
+  log "lv target   : $item"
+done
 
 for item in "${LV_LIST[@]-}"; do
   vg="${item%/*}"
@@ -368,10 +475,9 @@ for item in "${LV_LIST[@]-}"; do
 
       if is_active_state "$state_before"; then
         # Set rw and deactivate in one step to land on inactive+writable (-wi...).
-        lvchange -an -p rw "$item" >/dev/null 2>&1 || {
-          echo "error: failed to deactivate lv: $item" >&2
+        if ! deactivate_lv "$item"; then
           exit 1
-        }
+        fi
       else
         if ! set_lv_permission "$item" rw; then
           echo "error: failed to set rw on inactive lv: $item" >&2
