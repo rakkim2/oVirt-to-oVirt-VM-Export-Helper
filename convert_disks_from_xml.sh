@@ -1,22 +1,25 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-now_ts() {
-  date '+%F %T'
-}
-
-log() {
-  echo "[$(now_ts)] $*"
-}
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG_FILE="${CONFIG_FILE:-${SCRIPT_DIR}/import.conf}"
-CONF_SOURCE="default-env"
-if [[ -f "$CONFIG_FILE" ]]; then
-  # shellcheck source=/dev/null
-  source "$CONFIG_FILE"
-  CONF_SOURCE="$CONFIG_FILE"
+COMMON_ENV_FILE="${COMMON_ENV_FILE:-${SCRIPT_DIR}/common.env}"
+if [[ ! -f "$COMMON_ENV_FILE" ]]; then
+  echo "error: common library not found: $COMMON_ENV_FILE" >&2
+  exit 1
 fi
+# shellcheck source=/dev/null
+source "$COMMON_ENV_FILE"
+
+if [[ -z "${CONFIG_FILE:-}" ]]; then
+  CONFIG_FILE="${SCRIPT_DIR}/v2v.conf"
+fi
+declare -a PRESERVE_ENV_KEYS=(
+  DATA_BASE_DIR V2V_BASE_DIR V2V_LOG_BASE_DIR QEMU_BASE_DIR RAW_BASE_DIR
+  MAX_JOBS INPUT_FORMAT OUTPUT_FORMAT OUTPUT_OPTIONS SPARSE_SIZE
+  COROUTINES CACHE_MODE SRC_CACHE_MODE SCRIPT_LOG_ENABLE CONVERT_LOG_ENABLE
+  PROGRESS_INTERVAL RUN_LOG_DIR
+)
+CONF_SOURCE="$(v2v_load_config_with_env "$CONFIG_FILE" "${PRESERVE_ENV_KEYS[@]}")"
 
 usage() {
   cat >&2 <<'EOF'
@@ -28,12 +31,13 @@ Output format is qcow2.
 
 Fixed paths:
   XML            : <vm-xml input>
-  images output  : ${RAW_BASE_DIR:-/data/v2v}/<vm-name>/images (qcow2)
-  disk logs      : ${RAW_BASE_DIR:-/data/v2v}/<vm-name>/logs/qemu
+  images output  : ${QEMU_BASE_DIR:-/data/v2v/qemu}/<vm-name> (qcow2)
+  disk logs      : ${V2V_LOG_BASE_DIR:-/data/v2v_log}/<vm-name>/qemu
 
 Tune values via conf/env:
   MAX_JOBS, INPUT_FORMAT, OUTPUT_FORMAT, OUTPUT_OPTIONS,
-  SPARSE_SIZE, COROUTINES, CACHE_MODE, SRC_CACHE_MODE
+  SPARSE_SIZE, COROUTINES, CACHE_MODE, SRC_CACHE_MODE,
+  RECREATE_OUTPUT_ON_RETRY
 EOF
   exit 1
 }
@@ -43,16 +47,27 @@ if [[ $# -ne 1 ]]; then
 fi
 
 XML_PATH="$1"
-RAW_BASE_DIR="${RAW_BASE_DIR:-/data/v2v}"
+if [[ -z "${V2V_BASE_DIR+x}" && -n "${DATA_BASE_DIR+x}" ]]; then
+  V2V_BASE_DIR="${DATA_BASE_DIR%/}/v2v"
+fi
+if [[ -z "${QEMU_BASE_DIR+x}" && -n "${RAW_BASE_DIR+x}" ]]; then
+  QEMU_BASE_DIR="$RAW_BASE_DIR"
+fi
+V2V_BASE_DIR="${V2V_BASE_DIR:-/data/v2v}"
+V2V_LOG_BASE_DIR="${V2V_LOG_BASE_DIR:-/data/v2v_log}"
+QEMU_BASE_DIR="${QEMU_BASE_DIR:-${V2V_BASE_DIR%/}/qemu}"
 
 MAX_JOBS="${MAX_JOBS:-4}"
-INPUT_FORMAT="${INPUT_FORMAT:-raw}"
+INPUT_FORMAT="${INPUT_FORMAT:-auto}"
 OUTPUT_FORMAT="${OUTPUT_FORMAT:-qcow2}"
 OUTPUT_OPTIONS="${OUTPUT_OPTIONS:-compat=1.1,lazy_refcounts=off,cluster_size=65536}"
 SPARSE_SIZE="${SPARSE_SIZE:-}"
 COROUTINES="${COROUTINES:-8}"
 CACHE_MODE="${CACHE_MODE:-writeback}"
 SRC_CACHE_MODE="${SRC_CACHE_MODE:-none}"
+RECREATE_OUTPUT_ON_RETRY="${RECREATE_OUTPUT_ON_RETRY:-1}"
+SCRIPT_LOG_ENABLE="${SCRIPT_LOG_ENABLE:-1}"
+CONVERT_LOG_ENABLE="${CONVERT_LOG_ENABLE:-$SCRIPT_LOG_ENABLE}"
 
 if [[ ! -f "$XML_PATH" ]]; then
   echo "error: xml not found: $XML_PATH" >&2
@@ -86,11 +101,25 @@ if [[ -z "$vm_name" ]]; then
   exit 1
 fi
 
-OUT_DIR="${RAW_BASE_DIR%/}/${vm_name}/images"
-LOG_DIR="${RAW_BASE_DIR%/}/${vm_name}/logs/qemu"
-mkdir -p "$OUT_DIR" "$LOG_DIR"
+OUT_DIR="${QEMU_BASE_DIR%/}/${vm_name}"
+if [[ -n "${RUN_LOG_DIR:-}" ]]; then
+  SCRIPT_LOG_DIR="$RUN_LOG_DIR"
+  LOG_DIR="${RUN_LOG_DIR%/}/qemu"
+else
+  LOG_DIR="${V2V_LOG_BASE_DIR%/}/${vm_name}/qemu"
+  SCRIPT_LOG_DIR="${V2V_LOG_BASE_DIR%/}/${vm_name}"
+fi
+SCRIPT_LOG_FILE="${SCRIPT_LOG_DIR%/}/convert_disks_from_xml-$(date +%F_%H%M%S).log"
+
+mkdir -p "$OUT_DIR" "$LOG_DIR" "$SCRIPT_LOG_DIR"
+if is_enabled "$CONVERT_LOG_ENABLE"; then
+  exec > >(tee -a "$SCRIPT_LOG_FILE") 2>&1
+fi
 
 log "START convert_disks_from_xml xml=${XML_PATH} vm=${vm_name} config=${CONF_SOURCE}"
+if is_enabled "$CONVERT_LOG_ENABLE"; then
+  log "script log : $SCRIPT_LOG_FILE"
+fi
 
 disk_lines=$(
   awk '
@@ -157,6 +186,7 @@ declare -a PIDS=()
 declare -a PID_DESCS=()
 declare -a PID_LOGS=()
 declare -a PID_LAST_PCT=()
+declare -a PID_STATE=()
 
 PROGRESS_INTERVAL="${PROGRESS_INTERVAL:-30}"
 
@@ -206,11 +236,38 @@ wait_for_slot() {
   done
 }
 
+file_holders() {
+  local path="$1"
+  if command -v lsof >/dev/null 2>&1; then
+    lsof "$path" 2>/dev/null || true
+    return
+  fi
+  if command -v fuser >/dev/null 2>&1; then
+    fuser -v "$path" 2>/dev/null || true
+    return
+  fi
+  echo "(holder check unavailable: lsof/fuser not found)"
+}
+
+is_file_in_use() {
+  local path="$1"
+  if command -v lsof >/dev/null 2>&1; then
+    lsof "$path" >/dev/null 2>&1
+    return $?
+  fi
+  if command -v fuser >/dev/null 2>&1; then
+    fuser "$path" >/dev/null 2>&1
+    return $?
+  fi
+  return 1
+}
+
 launch_convert() {
   local idx="$1"
   local src_path="$2"
   local target_dev="$3"
   local out_ext="$4"
+  local input_fmt="$INPUT_FORMAT"
   local out_path="${OUT_DIR%/}/${vm_name}-disk${idx}.${out_ext}"
   local log_path="${LOG_DIR%/}/${vm_name}-disk${idx}.log"
   local start_ts
@@ -220,10 +277,34 @@ launch_convert() {
     echo "error: source is not readable block/file path: $src_path" >&2
     return 1
   fi
+  if [[ -e "$out_path" ]]; then
+    if is_file_in_use "$out_path"; then
+      echo "error: output image is in use by another process: $out_path" >&2
+      file_holders "$out_path" >&2
+      return 1
+    fi
+    if is_enabled "$RECREATE_OUTPUT_ON_RETRY"; then
+      log "cleanup     : remove old output ${out_path}"
+      rm -f "$out_path"
+    fi
+  fi
+
+  if [[ "$INPUT_FORMAT" == "auto" ]]; then
+    input_fmt="$(
+      qemu-img info --output=json "$src_path" 2>/dev/null \
+        | tr -d '\n' \
+        | sed -n 's/.*"format"[[:space:]]*:[[:space:]]*"\([^"]\+\)".*/\1/p'
+    )"
+    if [[ -z "$input_fmt" ]]; then
+      echo "error: failed to auto-detect input format: $src_path" >&2
+      echo "hint : set INPUT_FORMAT manually (e.g. raw or qcow2)" >&2
+      return 1
+    fi
+  fi
 
   (
     set -euo pipefail
-    cmd=(qemu-img convert -p -f "$INPUT_FORMAT" -O "$OUTPUT_FORMAT")
+    cmd=(qemu-img convert -p -f "$input_fmt" -O "$OUTPUT_FORMAT")
     if [[ -n "$OUTPUT_OPTIONS" ]]; then
       cmd+=(-o "$OUTPUT_OPTIONS")
     fi
@@ -243,6 +324,7 @@ launch_convert() {
 
     {
       echo "[$start_ts] start disk${idx} target=${target_dev}"
+      echo "input format: ${input_fmt}"
       printf 'cmd:'
       for token in "${cmd[@]}"; do
         printf ' %q' "$token"
@@ -261,24 +343,38 @@ launch_convert() {
   PID_DESCS+=("disk${idx}(${target_dev})")
   PID_LOGS+=("$log_path")
   PID_LAST_PCT+=("")
+  PID_STATE+=("running")
 
-  log "queued: disk${idx} target=${target_dev} pid=${pid}"
+  log "queued: disk${idx} target=${target_dev} src=${src_path} out=${out_path} log=${log_path} pid=${pid}"
 }
 
 progress_from_log() {
   local log_path="$1"
   local pct
+  local tail_text=""
 
   if [[ ! -f "$log_path" ]]; then
     echo ""
     return
   fi
 
-  pct=$(
-    tail -c 65536 "$log_path" 2>/dev/null \
-      | perl -0777 -ne 'while(/\(\s*([0-9]+(?:\.[0-9]+)?)\/100%\)/g){$p=$1} END{print $p if defined $p}' \
+  tail_text="$(tail -c 131072 "$log_path" 2>/dev/null | tr '\r' '\n' || true)"
+  pct="$(
+    printf '%s' "$tail_text" \
+      | grep -Eo '[0-9]+([.][0-9]+)?/100%' \
+      | tail -n1 \
+      | cut -d/ -f1 \
       || true
-  )
+  )"
+  if [[ -z "$pct" ]]; then
+    pct="$(
+      printf '%s' "$tail_text" \
+        | grep -Eo '[0-9]+([.][0-9]+)?%' \
+        | tail -n1 \
+        | tr -d '%' \
+        || true
+    )"
+  fi
 
   if [[ -n "$pct" ]]; then
     echo "$pct"
@@ -294,6 +390,7 @@ log "log dir     : $LOG_DIR"
 log "max jobs    : $MAX_JOBS"
 log "input fmt   : $INPUT_FORMAT"
 log "output fmt  : $OUTPUT_FORMAT"
+log "overwrite   : $RECREATE_OUTPUT_ON_RETRY"
 
 out_ext="$OUTPUT_FORMAT"
 while IFS=$'\t' read -r idx src_path target_dev; do
@@ -311,9 +408,16 @@ done
 
 while :; do
   running=0
+  done_count=0
+  fail_count=0
 
   for i in "${!PIDS[@]}"; do
     if [[ "${PID_DONE[$i]}" == "1" ]]; then
+      if [[ "${PID_STATE[$i]}" == "done" ]]; then
+        done_count=$((done_count + 1))
+      elif [[ "${PID_STATE[$i]}" == "fail" ]]; then
+        fail_count=$((fail_count + 1))
+      fi
       continue
     fi
 
@@ -323,6 +427,7 @@ while :; do
 
     if kill -0 "$pid" 2>/dev/null; then
       running=$((running + 1))
+      PID_STATE[$i]="running"
       pct=$(progress_from_log "$log_path")
       if [[ -n "$pct" ]]; then
         PID_LAST_PCT[$i]="$pct"
@@ -333,21 +438,31 @@ while :; do
     if wait "$pid"; then
       log "ok   : ${desc}"
       PID_LAST_PCT[$i]="100.00"
+      PID_STATE[$i]="done"
+      done_count=$((done_count + 1))
     else
       echo "[$(now_ts)] fail : ${desc} (log: ${log_path})" >&2
       fail=1
+      PID_STATE[$i]="fail"
+      fail_count=$((fail_count + 1))
     fi
     PID_DONE[$i]="1"
   done
 
-  progress_line="progress(${vm_name}):"
+  progress_line="progress(${vm_name}): running=${running} done=${done_count}/${#PIDS[@]} fail=${fail_count}"
+  log "$progress_line"
   for i in "${!PIDS[@]}"; do
     desc="${PID_DESCS[$i]}"
     pct="${PID_LAST_PCT[$i]}"
-    if [[ -n "$pct" ]]; then
-      progress_line="${progress_line} ${desc}=${pct}%"
+    state="${PID_STATE[$i]}"
+    if [[ "$state" == "done" ]]; then
+      log "  ${desc}: done (100.00%)"
+    elif [[ "$state" == "fail" ]]; then
+      log "  ${desc}: fail"
+    elif [[ -n "$pct" ]]; then
+      log "  ${desc}: ${pct}%"
     else
-      progress_line="${progress_line} ${desc}=-"
+      log "  ${desc}: -"
     fi
   done
 
@@ -355,7 +470,6 @@ while :; do
     break
   fi
 
-  log "$progress_line"
   sleep "$PROGRESS_INTERVAL"
 done
 
