@@ -49,6 +49,116 @@ is_pid_alive() {
   kill -0 "$pid" >/dev/null 2>&1
 }
 
+wait_pid_exit() {
+  local pid="$1"
+  local timeout="$2"
+  local waited=0
+
+  while (( waited < timeout )); do
+    if ! is_pid_alive "$pid"; then
+      return 0
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+
+  if ! is_pid_alive "$pid"; then
+    return 0
+  fi
+  return 1
+}
+
+list_descendants() {
+  local root="$1"
+  local child=""
+
+  if ! command -v pgrep >/dev/null 2>&1; then
+    return 0
+  fi
+
+  while IFS= read -r child; do
+    [[ -z "$child" ]] && continue
+    echo "$child"
+    list_descendants "$child"
+  done < <(pgrep -P "$root" 2>/dev/null || true)
+}
+
+kill_pid_tree() {
+  local root="$1"
+  local sig="$2"
+  local p=""
+  local targets=()
+  local desc=""
+
+  if is_pid_alive "$root"; then
+    while IFS= read -r desc; do
+      [[ -z "$desc" ]] && continue
+      targets+=("$desc")
+    done < <(list_descendants "$root" | awk '!seen[$0]++')
+    targets+=("$root")
+  fi
+
+  for (( i=${#targets[@]}-1; i>=0; i-- )); do
+    p="${targets[$i]}"
+    if is_pid_alive "$p"; then
+      kill "-${sig}" "$p" 2>/dev/null || true
+    fi
+  done
+}
+
+stop_import_vm() {
+  local vm_name="$1"
+  local lock_dir="${IMPORT_LOCK_BASE_DIR%/}/${vm_name}.lock"
+  local pid_file="${lock_dir}/pid"
+  local legacy_pid_file="${IMPORT_LOCK_BASE_DIR%/}/${vm_name}.pid"
+  local pid=""
+
+  if [[ -f "$pid_file" ]]; then
+    pid="$(cat "$pid_file" 2>/dev/null || true)"
+  elif [[ -f "$legacy_pid_file" ]]; then
+    pid="$(cat "$legacy_pid_file" 2>/dev/null || true)"
+  fi
+
+  if [[ -z "$pid" ]]; then
+    if [[ ! -d "$lock_dir" ]]; then
+      echo "info: no import lock found for vm=${vm_name} under ${IMPORT_LOCK_BASE_DIR}" >&2
+      rm -f "$legacy_pid_file" >/dev/null 2>&1 || true
+      return 0
+    fi
+    echo "warn: import lock exists but pid missing: ${lock_dir}" >&2
+    rm -rf "$lock_dir" >/dev/null 2>&1 || true
+    rm -f "$legacy_pid_file" >/dev/null 2>&1 || true
+    return 0
+  fi
+
+  if ! is_pid_alive "$pid"; then
+    echo "warn: stale import pid for vm=${vm_name}: pid=${pid}" >&2
+    rm -rf "$lock_dir" >/dev/null 2>&1 || true
+    rm -f "$legacy_pid_file" >/dev/null 2>&1 || true
+    return 0
+  fi
+
+  log "STOP import vm=${vm_name} pid=${pid} wait=${IMPORT_STOP_WAIT_SECONDS}s"
+  log "cmd stop     : TERM process tree rooted at pid=${pid}"
+  kill_pid_tree "$pid" TERM
+
+  if ! wait_pid_exit "$pid" "$IMPORT_STOP_WAIT_SECONDS"; then
+    log "cmd stop     : KILL process tree rooted at pid=${pid}"
+    kill_pid_tree "$pid" KILL
+    sleep 1
+  fi
+
+  if is_pid_alive "$pid"; then
+    echo "error: failed to stop import vm=${vm_name} pid=${pid}" >&2
+    return 1
+  fi
+
+  rm -rf "$lock_dir" >/dev/null 2>&1 || true
+  rm -f "$legacy_pid_file" >/dev/null 2>&1 || true
+  log "DONE stop import vm=${vm_name}"
+  return 0
+}
+
 lock_holder_pid() {
   local lock_dir="$1"
   local pid_file="${lock_dir}/pid"
@@ -363,6 +473,11 @@ if [[ "$mode" == "check" ]]; then
   exit 0
 fi
 
+if [[ "$mode" == "stop" ]]; then
+  CONFIG_FILE="$remote_config" RUN_LOG_DIR="$run_log_dir" IMPORT_RUN_WITH_NOHUP=false bash "$script_path" --stop "$vm_name"
+  exit 0
+fi
+
 if [[ "$precheck" == "true" ]]; then
   CONFIG_FILE="$remote_config" RUN_LOG_DIR="$run_log_dir" PRECHECK=true IMPORT_RUN_WITH_NOHUP=false bash "$script_path" --run-location=targetspm --check "$vm_name" "$csv_path"
 fi
@@ -385,6 +500,8 @@ EOS
 usage() {
   cat >&2 <<'EOF'
 usage:
+  import_v2v.sh --stop <vm-name>
+  import_v2v.sh --run-location=remote --stop <vm-name>
   import_v2v.sh --run-location=targetspm <vm-name> [csv-path]
   import_v2v.sh --run-location=targetspm --check <vm-name> [csv-path]
   import_v2v.sh --run-location=remote <vm-name> [csv-path]
@@ -402,6 +519,7 @@ Config/env options:
   - IMPORT_RUN_WITH_NOHUP     (default: true)
   - PRECHECK                  (default: false)
   - IMPORT_LOCK_BASE_DIR      (default: ${V2V_BASE_DIR}/locks/import_v2v)
+  - IMPORT_STOP_WAIT_SECONDS  (default: 10, seconds before KILL in --stop)
   - ENGINE_CONNECT_TIMEOUT    (default: 10, seconds)
   - REMOTE_TARGET_HOST        (required when --run-location=remote)
   - REMOTE_TARGET_USER        (default: root)
@@ -420,19 +538,34 @@ Required RHV options (set in v2v.conf):
   - RHV_CLUSTER_DEFAULT / RHV_STORAGE_DEFAULT (or provide vm mapping in CSV)
 
 Modes:
+  - stop         : terminate running import process tree for vm and cleanup lock
   - run          : precheck + actual import (default)
   - check        : precheck only (dry-run style), no import execution
-  - run-location : required. must be targetspm or remote
+  - run-location : required in run/check mode. must be targetspm or remote
 EOF
   exit 1
 }
 
 MODE="run"
 RUN_LOCATION=""
+STOP_VM_INPUT=""
 while [[ $# -gt 0 ]]; do
   case "${1:-}" in
     -h|--help)
       usage
+      ;;
+    --stop=*)
+      MODE="stop"
+      STOP_VM_INPUT="${1#*=}"
+      if [[ -z "$STOP_VM_INPUT" ]]; then
+        echo "error: --stop requires vm name" >&2
+        usage
+      fi
+      shift
+      ;;
+    --stop)
+      MODE="stop"
+      shift
       ;;
     --check)
       MODE="check"
@@ -464,7 +597,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -z "$RUN_LOCATION" ]]; then
+if [[ "$MODE" != "stop" && -z "$RUN_LOCATION" ]]; then
   echo "error: --run-location is required (targetspm or remote)" >&2
   usage
 fi
@@ -487,7 +620,18 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ $# -lt 1 || $# -gt 2 ]]; then
+if [[ "$MODE" == "stop" ]]; then
+  if [[ -z "$STOP_VM_INPUT" ]]; then
+    if [[ $# -ne 1 ]]; then
+      usage
+    fi
+    STOP_VM_INPUT="$1"
+    shift
+  fi
+  if [[ $# -ne 0 ]]; then
+    usage
+  fi  
+elif [[ $# -lt 1 || $# -gt 2 ]]; then
   usage
 fi
 
@@ -509,7 +653,11 @@ declare -a PRESERVE_ENV_KEYS=(
 )
 CONF_SOURCE="$(v2v_load_config_with_env "$CONFIG_FILE" "${PRESERVE_ENV_KEYS[@]}")"
 
-VM_INPUT_RAW="$1"
+if [[ "$MODE" == "stop" ]]; then
+  VM_INPUT_RAW="$STOP_VM_INPUT"
+else
+  VM_INPUT_RAW="$1"
+fi
 VM_NAME="$(normalize_vm_name_input "$VM_INPUT_RAW")"
 if [[ -z "$VM_NAME" ]]; then
   echo "error: failed to normalize vm name from input: $VM_INPUT_RAW" >&2
@@ -537,6 +685,7 @@ IMPORT_RUN_WITH_NOHUP="$(normalize_bool "${IMPORT_RUN_WITH_NOHUP:-true}")" || ex
 PRECHECK="$(normalize_bool "${PRECHECK:-false}")" || exit 1
 NOHUP_LAUNCHED="${NOHUP_LAUNCHED:-0}"
 IMPORT_LOCK_BASE_DIR="${IMPORT_LOCK_BASE_DIR:-${V2V_BASE_DIR%/}/locks/import_v2v}"
+IMPORT_STOP_WAIT_SECONDS="${IMPORT_STOP_WAIT_SECONDS:-10}"
 ENGINE_CONNECT_TIMEOUT="${ENGINE_CONNECT_TIMEOUT:-10}"
 
 RHV_ENGINE_URL="${RHV_ENGINE_URL:-}"
@@ -655,6 +804,31 @@ if [[ -n "$RUN_LOG_DIR" ]]; then
 fi
 LOG_FILE="${LOG_DIR%/}/import_v2v-$(date +%F_%H%M%S).log"
 LOCK_DIR="${IMPORT_LOCK_BASE_DIR%/}/${VM_NAME}.lock"
+
+if [[ ! "$IMPORT_STOP_WAIT_SECONDS" =~ ^[0-9]+$ ]] || (( IMPORT_STOP_WAIT_SECONDS < 1 )); then
+  echo "error: IMPORT_STOP_WAIT_SECONDS must be integer >= 1 (current: $IMPORT_STOP_WAIT_SECONDS)" >&2
+  exit 1
+fi
+
+if [[ "$MODE" == "stop" ]]; then
+  if [[ "$REMOTE_MODE" == "true" ]]; then
+    mkdir -p "$LOG_DIR"
+    if [[ "$IMPORT_V2V_LOG_ENABLE" == "true" ]]; then
+      exec > >(tee -a "$LOG_FILE") 2>&1
+    fi
+    log "START import_v2v vm=${VM_NAME} mode=stop run-location=remote config=${CONF_SOURCE}"
+    if run_remote_import "$CSV_PATH"; then
+      log "DONE import_v2v vm=${VM_NAME} mode=stop run-location=remote"
+      exit 0
+    else
+      rc=$?
+      log "FAIL import_v2v vm=${VM_NAME} mode=stop run-location=remote rc=${rc}"
+      exit "$rc"
+    fi
+  fi
+  stop_import_vm "$VM_NAME"
+  exit $?
+fi
 
 if [[ ! "$ENGINE_CONNECT_TIMEOUT" =~ ^[0-9]+$ ]] || (( ENGINE_CONNECT_TIMEOUT < 1 )); then
   echo "error: ENGINE_CONNECT_TIMEOUT must be integer >= 1 (current: $ENGINE_CONNECT_TIMEOUT)" >&2
