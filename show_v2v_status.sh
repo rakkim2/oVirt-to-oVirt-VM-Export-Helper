@@ -402,6 +402,7 @@ print_board() {
   local ts=""
   local ts_file=""
   local run_dir=""
+  local import_newer="false"
 
   vm_list="$(collect_vms || true)"
 
@@ -434,16 +435,27 @@ print_board() {
     else
       i_log="$(latest_vm_log "$vm" 'import_v2v*.log')"
     fi
+    # If pipeline log exists but no import log in that run dir,
+    # fallback to the latest VM-level import log (import-only run).
+    if [[ -z "$i_log" ]]; then
+      i_log="$(latest_vm_log "$vm" 'import_v2v*.log')"
+    fi
     p_stage="$(pipeline_stage "$p_log")"
     i_stage="$(import_stage "$i_log")"
     q_sum="$(qemu_summary "$vm" "$run_dir")"
     o_sum="$(ova_summary "$vm" "$p_log" "$p_stage" "$run_dir")"
+    if [[ -n "$i_log" && ( -z "$p_log" || "$i_log" -nt "$p_log" ) ]]; then
+      import_newer="true"
+    else
+      import_newer="false"
+    fi
+
     start_ts="$(extract_first_ts "$p_log")"
-    if [[ "$start_ts" == "-" ]]; then
+    if [[ "$start_ts" == "-" || "$import_newer" == "true" ]]; then
       start_ts="$(extract_first_ts "$i_log")"
     fi
     ts_file="$p_log"
-    if [[ -n "$i_log" && ( -z "$p_log" || "$i_log" -nt "$p_log" ) ]]; then
+    if [[ "$import_newer" == "true" ]]; then
       ts_file="$i_log"
     fi
     ts="$(extract_ts "$ts_file")"
@@ -490,6 +502,16 @@ print_board() {
 
     if [[ "$p_lock" == "-" && "$i_lock" != "-" ]]; then
       p_lock="imp:${i_lock}"
+    fi
+
+    # If the latest activity is standalone import and pipeline is not running,
+    # don't keep showing an old pipeline failure as current pipe state.
+    if [[ "$p_lock" == "-" && "$import_newer" == "true" ]]; then
+      case "$p_stage" in
+        failed|done|stopped|stale-lock|-)
+          p_stage="import-only"
+          ;;
+      esac
     fi
 
     i_sum="$(import_summary "$i_log" "$i_stage")"
