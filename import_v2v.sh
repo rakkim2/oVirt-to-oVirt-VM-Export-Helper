@@ -269,6 +269,7 @@ run_remote_import() {
   local remote_config_guess="${REMOTE_IMPORT_SCRIPT%/*}/v2v.conf"
   local remote_config="${CONFIG_FILE:-$remote_config_guess}"
   local remote_import_nohup="${IMPORT_RUN_WITH_NOHUP:-true}"
+  local ssh_err_log="${LOG_DIR%/}/import_v2v-remote-ssh-$(date +%F_%H%M%S).log"
   local -a ssh_cmd=(ssh)
   local -a ssh_args=(-p "$REMOTE_SSH_PORT")
 
@@ -319,13 +320,16 @@ run_remote_import() {
   log "mode          : ${MODE}"
   log "precheck      : ${PRECHECK}"
   log "remote nohup  : ${remote_import_nohup}"
+  log "ssh opts      : ${REMOTE_SSH_OPTS:-<none>}"
+  log "ssh err log   : ${ssh_err_log}"
   if [[ -n "$REMOTE_SSH_PASS_FILE" || -n "$REMOTE_SSH_PASS" ]]; then
     log "ssh auth      : sshpass"
   else
     log "ssh auth      : interactive/key"
   fi
 
-  "${ssh_cmd[@]}" "${ssh_args[@]}" "$remote_login" bash -s -- "$REMOTE_IMPORT_SCRIPT" "$VM_NAME" "$csv_path" "$MODE" "$PRECHECK" "${RUN_LOG_DIR:-}" "$remote_config" "$remote_import_nohup" <<'EOS'
+  : > "$ssh_err_log"
+  if "${ssh_cmd[@]}" "${ssh_args[@]}" "$remote_login" bash -s -- "$REMOTE_IMPORT_SCRIPT" "$VM_NAME" "$csv_path" "$MODE" "$PRECHECK" "${RUN_LOG_DIR:-}" "$remote_config" "$remote_import_nohup" 2> >(tee -a "$ssh_err_log" >&2) <<'EOS'
 set -euo pipefail
 script_path="$1"
 vm_name="$2"
@@ -367,6 +371,13 @@ fi
 # so the source-side wrapper decides precheck timing.
 CONFIG_FILE="$remote_config" RUN_LOG_DIR="$run_log_dir" PRECHECK=false IMPORT_RUN_WITH_NOHUP="$import_nohup" bash "$script_path" --run-location=targetspm "$vm_name" "$csv_path"
 EOS
+  then
+    :
+  else
+    rc=$?
+    log "FAIL remote ssh execution rc=${rc} err_log=${ssh_err_log}"
+    return "$rc"
+  fi
 
   log "DONE import_v2v(remote) vm=${VM_NAME}"
 }
@@ -395,7 +406,7 @@ Config/env options:
   - REMOTE_TARGET_HOST        (required when --run-location=remote)
   - REMOTE_TARGET_USER        (default: root)
   - REMOTE_SSH_PORT           (default: 22)
-  - REMOTE_SSH_OPTS           (optional)
+  - REMOTE_SSH_OPTS           (default: -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null)
   - REMOTE_SSH_PASS_FILE      (optional; sshpass password file)
   - REMOTE_SSH_PASS           (optional; plain password string)
   - REMOTE_IMPORT_SCRIPT      (default: /data/script/import_v2v.sh on target)
@@ -538,7 +549,7 @@ RHV_DIRECT="$(normalize_bool "${RHV_DIRECT:-false}")" || exit 1
 REMOTE_TARGET_HOST="${REMOTE_TARGET_HOST:-}"
 REMOTE_TARGET_USER="${REMOTE_TARGET_USER:-root}"
 REMOTE_SSH_PORT="${REMOTE_SSH_PORT:-22}"
-REMOTE_SSH_OPTS="${REMOTE_SSH_OPTS:-}"
+REMOTE_SSH_OPTS="${REMOTE_SSH_OPTS:--o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null}"
 REMOTE_SSH_PASS_FILE="${REMOTE_SSH_PASS_FILE:-}"
 REMOTE_SSH_PASS="${REMOTE_SSH_PASS:-}"
 REMOTE_IMPORT_SCRIPT="${REMOTE_IMPORT_SCRIPT:-/data/script/import_v2v.sh}"
@@ -651,8 +662,23 @@ if [[ ! "$ENGINE_CONNECT_TIMEOUT" =~ ^[0-9]+$ ]] || (( ENGINE_CONNECT_TIMEOUT < 
 fi
 
 if [[ "$REMOTE_MODE" == "true" ]]; then
-  run_remote_import "$CSV_PATH"
-  exit $?
+  mkdir -p "$LOG_DIR"
+  if [[ "$IMPORT_V2V_LOG_ENABLE" == "true" ]]; then
+    exec > >(tee -a "$LOG_FILE") 2>&1
+  fi
+  log "START import_v2v vm=${VM_NAME} config=${CONF_SOURCE}"
+  if [[ "$IMPORT_V2V_LOG_ENABLE" == "true" ]]; then
+    log "script log   : $LOG_FILE"
+  fi
+
+  if run_remote_import "$CSV_PATH"; then
+    log "DONE import_v2v vm=${VM_NAME}"
+    exit 0
+  else
+    rc=$?
+    log "FAIL import_v2v vm=${VM_NAME} rc=${rc}"
+    exit "$rc"
+  fi
 fi
 
 if [[ "$MODE" == "run" && "$IMPORT_RUN_WITH_NOHUP" == "true" && "$NOHUP_LAUNCHED" != "1" ]]; then

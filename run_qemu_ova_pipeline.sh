@@ -172,6 +172,7 @@ dump_failure_context() {
   local latest_convert=""
   local latest_ova=""
   local latest_import=""
+  local latest_import_remote_ssh=""
   local qlog=""
   local qlog_pattern="${vm_log_dir}/qemu/${VM_NAME}-disk*.log"
   local qemu_count=0
@@ -186,18 +187,21 @@ dump_failure_context() {
     latest_convert="$(ls -1t "${run_log_dir}"/convert_disks_from_xml-*.log 2>/dev/null | head -n1 || true)"
     latest_ova="$(ls -1t "${run_log_dir}"/make_ovirt_ova-*.log 2>/dev/null | head -n1 || true)"
     latest_import="$(ls -1t "${run_log_dir}"/import_v2v-*.log 2>/dev/null | head -n1 || true)"
+    latest_import_remote_ssh="$(ls -1t "${run_log_dir}"/import_v2v-remote-ssh-*.log 2>/dev/null | head -n1 || true)"
     qlog_pattern="${run_log_dir}/qemu/${VM_NAME}-disk*.log"
   else
     latest_toggle="$(ls -1t "${vm_log_dir}"/toggle_lv_from_xml-*.log 2>/dev/null | head -n1 || true)"
     latest_convert="$(ls -1t "${vm_log_dir}"/convert_disks_from_xml-*.log 2>/dev/null | head -n1 || true)"
     latest_ova="$(ls -1t "${vm_log_dir}"/make_ovirt_ova-*.log 2>/dev/null | head -n1 || true)"
     latest_import="$(ls -1t "${vm_log_dir}"/import_v2v-*.log 2>/dev/null | head -n1 || true)"
+    latest_import_remote_ssh="$(ls -1t "${vm_log_dir}"/import_v2v-remote-ssh-*.log 2>/dev/null | head -n1 || true)"
   fi
 
   [[ -n "$latest_toggle" ]] && dump_log_tail "toggle_lv_from_xml" "$latest_toggle"
   [[ -n "$latest_convert" ]] && dump_log_tail "convert_disks_from_xml" "$latest_convert"
   [[ -n "$latest_ova" ]] && dump_log_tail "make_ovirt_ova" "$latest_ova"
   [[ -n "$latest_import" ]] && dump_log_tail "import_v2v" "$latest_import"
+  [[ -n "$latest_import_remote_ssh" ]] && dump_log_tail "import_v2v_remote_ssh" "$latest_import_remote_ssh"
 
   while IFS= read -r qlog; do
     [[ -z "$qlog" ]] && continue
@@ -344,7 +348,7 @@ IMPORT_CSV_PATH="${IMPORT_CSV_PATH:-}"
 REMOTE_TARGET_HOST="${REMOTE_TARGET_HOST:-}"
 REMOTE_TARGET_USER="${REMOTE_TARGET_USER:-root}"
 REMOTE_SSH_PORT="${REMOTE_SSH_PORT:-22}"
-REMOTE_SSH_OPTS="${REMOTE_SSH_OPTS:-}"
+REMOTE_SSH_OPTS="${REMOTE_SSH_OPTS:--o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null}"
 REMOTE_IMPORT_SCRIPT="${REMOTE_IMPORT_SCRIPT:-/data/script/import_v2v.sh}"
 REMOTE_CSV_PATH="${REMOTE_CSV_PATH:-}"
 IMPORT_CSV_PATH="$(v2v_expand_conf_placeholders "${IMPORT_CSV_PATH:-}")"
