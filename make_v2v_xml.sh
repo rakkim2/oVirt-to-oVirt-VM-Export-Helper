@@ -380,11 +380,11 @@ END {
   print "  <memory unit=\"KiB\">" mem "</memory>"
   print "  <currentMemory unit=\"KiB\">" curmem "</currentMemory>"
 
-  if (vcpu_current != "" && vcpu_current != vcpu_total) {
-    print "  <vcpu placement=\"static\" current=\"" vcpu_current "\">" vcpu_total "</vcpu>"
-  } else {
-    print "  <vcpu>" vcpu_total "</vcpu>"
-  }
+  # Use current vCPU as effective vCPU for migration/import.
+  # Some targets can interpret the element body (max vCPU) as actual vCPU.
+  vcpu_effective = vcpu_current
+  if (vcpu_effective == "") vcpu_effective = vcpu_total
+  print "  <vcpu>" vcpu_effective "</vcpu>"
 
   print "  <os>"
   if (machine != "") {
