@@ -40,6 +40,10 @@ WATCH="false"
 WATCH_SEC="5"
 RESET_STATUS_MODE="false"
 RESET_STATUS_ONLY="false"
+RESET_PURGE_LOGS="false"
+SHOW_ALL="false"
+LOOKBACK_HOURS="24"
+SORT_MODE="host"
 declare -a VM_FILTERS=()
 
 usage() {
@@ -51,18 +55,93 @@ usage:
 description:
   Collects each remote host's show_v2v_status output over SSH and prints only
   VM rows as:
-    HOSTNAME|VM|PIPE_LOCK|PIPE|START_TIME|LAST_UPDATE|STATE
+    NO|HOSTNAME|TARGET_HOST|VM|PIPE_LOCK|PIPE|START_TIME|LAST_UPDATE|STATE
 
 options:
   --watch           refresh every 5 sec
   --watch=<sec>     refresh every <sec> sec
   -w <sec>          same as --watch=<sec>
-  --reset-status    clear stale VM logs/locks on each host once, then show
-  --reset-only      clear stale VM logs/locks on each host once, then exit
+  --sort=<mode>     sort rows by host or start_time (default: host)
+  --reset-status    clear stale VM locks only on each host once, then show
+  --reset-only      clear stale VM locks only on each host once, then exit
+  --reset-purge     DANGEROUS: clear stale VM logs+locks on each host once
+  --all             show all rows (default: only recent 24h rows)
   --iface <name>    network interface on remote (default: auto)
   -h, --help        show this help
 EOF
   exit "$rc"
+}
+
+normalize_sort_mode() {
+  local mode="${1:-host}"
+  case "$mode" in
+    host|start_time)
+      printf '%s' "$mode"
+      ;;
+    *)
+      echo "error: --sort must be one of: host, start_time (current: $mode)" >&2
+      exit 1
+      ;;
+  esac
+}
+
+calc_since_ts() {
+  local hours="${1:-24}"
+  local ts=""
+
+  if ts="$(date -d "-${hours} hour" '+%F %T' 2>/dev/null)"; then
+    echo "$ts"
+    return
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    ts="$(
+      python3 - "$hours" <<'PY'
+import sys
+from datetime import datetime, timedelta
+hours = int(sys.argv[1])
+print((datetime.now() - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S"))
+PY
+    )"
+    if [[ -n "$ts" ]]; then
+      echo "$ts"
+      return
+    fi
+  fi
+
+  echo ""
+}
+
+row_is_recent() {
+  local row="$1"
+  local since_ts="$2"
+  local vm=""
+  local pipe_lock=""
+  local pipe_state=""
+  local start_ts=""
+  local last_ts=""
+  local state=""
+  local ts=""
+
+  IFS='|' read -r vm pipe_lock pipe_state start_ts last_ts state <<< "$row"
+
+  # Always keep currently running rows regardless of time window.
+  if [[ "$pipe_lock" == run:* || "$pipe_lock" == imp:run:* ]]; then
+    return 0
+  fi
+
+  ts="$last_ts"
+  if [[ ! "$ts" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}\ [0-9]{2}:[0-9]{2}:[0-9]{2}$ ]]; then
+    ts="$start_ts"
+  fi
+
+  if [[ ! "$ts" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}\ [0-9]{2}:[0-9]{2}:[0-9]{2}$ ]]; then
+    return 1
+  fi
+
+  if [[ -z "$since_ts" ]]; then
+    return 0
+  fi
+  [[ "$ts" > "$since_ts" || "$ts" == "$since_ts" ]]
 }
 
 load_local_config() {
@@ -154,6 +233,81 @@ extract_field() {
       '
 }
 
+row_start_key() {
+  local row="$1"
+  local vm=""
+  local pipe_lock=""
+  local pipe_state=""
+  local start_ts=""
+  local last_ts=""
+  local state=""
+
+  IFS='|' read -r vm pipe_lock pipe_state start_ts last_ts state <<< "$row"
+  if [[ "$start_ts" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}\ [0-9]{2}:[0-9]{2}:[0-9]{2}$ ]]; then
+    printf '%s' "$start_ts"
+    return
+  fi
+  if [[ "$last_ts" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}\ [0-9]{2}:[0-9]{2}:[0-9]{2}$ ]]; then
+    printf '%s' "$last_ts"
+    return
+  fi
+  printf '%s' '9999-12-31 23:59:59'
+}
+
+sort_rows_if_needed() {
+  local -n _hosts_ref=$1
+  local -n _targets_ref=$2
+  local -n _lines_ref=$3
+  local -n _host_idx_ref=$4
+  local -n _start_key_ref=$5
+  local count=0
+  local i=0
+  local sorted=""
+  local start_key=""
+  local host_idx=""
+  local host_name=""
+  local target_host=""
+  local row=""
+
+  count="${#_lines_ref[@]}"
+  if (( count <= 1 )); then
+    return
+  fi
+
+  case "$SORT_MODE" in
+    host)
+      return
+      ;;
+    start_time)
+      sorted="$(
+        for (( i=0; i<count; i++ )); do
+          printf '%s\t%09d\t%s\t%s\t%s\n' \
+            "${_start_key_ref[$i]}" \
+            "${_host_idx_ref[$i]}" \
+            "${_hosts_ref[$i]}" \
+            "${_targets_ref[$i]}" \
+            "${_lines_ref[$i]}"
+        done | LC_ALL=C sort -t $'\t' -k1,1 -k2,2
+      )"
+
+      _hosts_ref=()
+      _targets_ref=()
+      _lines_ref=()
+      _host_idx_ref=()
+      _start_key_ref=()
+
+      while IFS=$'\t' read -r start_key host_idx host_name target_host row; do
+        [[ -n "$row" ]] || continue
+        _start_key_ref+=("$start_key")
+        _host_idx_ref+=("$host_idx")
+        _hosts_ref+=("$host_name")
+        _targets_ref+=("$target_host")
+        _lines_ref+=("$row")
+      done <<< "$sorted"
+      ;;
+  esac
+}
+
 fetch_remote() {
   local host="$1"
   shift || true
@@ -183,6 +337,7 @@ fetch_remote() {
       REMOTE_CONFIG_FILE="$REMOTE_CONFIG_FILE" \
       RESET_STATUS_MODE="$RESET_STATUS_MODE" \
       RESET_STATUS_ONLY="$RESET_STATUS_ONLY" \
+      RESET_PURGE_LOGS="$RESET_PURGE_LOGS" \
       bash -s -- "$@" 2>&1 <<'EOS'
 set -euo pipefail
 net_iface="${NET_IFACE:-auto}"
@@ -190,6 +345,7 @@ status_script="${REMOTE_STATUS_SCRIPT:-/data/script/show_v2v_status.sh}"
 config_file="${REMOTE_CONFIG_FILE:-/data/script/v2v.conf}"
 reset_mode="${RESET_STATUS_MODE:-false}"
 reset_only="${RESET_STATUS_ONLY:-false}"
+purge_logs="${RESET_PURGE_LOGS:-false}"
 
 is_enabled() {
   local v
@@ -234,7 +390,10 @@ reset_vm_state() {
     return
   fi
 
-  rm -rf "${V2V_LOG_BASE_DIR%/}/${vm}" "$vm_lock" "$imp_lock"
+  if is_enabled "$purge_logs"; then
+    rm -rf "${V2V_LOG_BASE_DIR%/}/${vm}"
+  fi
+  rm -rf "$vm_lock" "$imp_lock"
 }
 
 collect_reset_targets() {
@@ -247,11 +406,13 @@ collect_reset_targets() {
   fi
 
   {
-    for d in "${V2V_LOG_BASE_DIR%/}"/*; do
-      [[ -d "$d" ]] || continue
-      base="$(basename "$d")"
-      printf '%s\n' "$base"
-    done
+    if is_enabled "$purge_logs"; then
+      for d in "${V2V_LOG_BASE_DIR%/}"/*; do
+        [[ -d "$d" ]] || continue
+        base="$(basename "$d")"
+        printf '%s\n' "$base"
+      done
+    fi
     for d in "${VM_LOCK_BASE_DIR%/}"/*.lock; do
       [[ -d "$d" ]] || continue
       base="$(basename "$d")"
@@ -301,6 +462,11 @@ if [[ -f "$config_file" ]]; then
   IMPORT_LOCK_BASE_DIR="${IMPORT_LOCK_BASE_DIR:-${V2V_BASE_DIR%/}/locks/import_v2v}"
 fi
 
+target_host="${REMOTE_TARGET_HOST:-}"
+target_host="$(printf '%s' "$target_host" | tr -cd '[:alnum:]._:-')"
+[[ -n "$target_host" ]] || target_host="-"
+printf '__CFG__ target=%s\n' "$target_host"
+
 if is_enabled "$reset_mode"; then
   while IFS= read -r vm; do
     [[ -z "$vm" ]] && continue
@@ -332,25 +498,42 @@ print_once() {
   local output=""
   local rc=0
   local net_line=""
+  local cfg_line=""
   local status_text=""
   local host_name=""
+  local target_host=""
   local vm_rows=""
   local line=""
   local any_vm="0"
   local host_w=4
+  local target_w=11
   local len=0
   local i=0
+  local no=1
+  local since_ts=""
+  local host_idx=0
   local -a row_hosts=()
+  local -a row_targets=()
   local -a row_lines=()
+  local -a row_host_indexes=()
+  local -a row_start_keys=()
+
+  if [[ "$SHOW_ALL" != "true" ]]; then
+    since_ts="$(calc_since_ts "$LOOKBACK_HOURS")"
+  fi
 
   for host in "${HOSTS[@]}"; do
+    host_idx=$((host_idx + 1))
     output="$(fetch_remote "$host" "${VM_FILTERS[@]}" || true)"
     rc=$?
     net_line="$(printf '%s\n' "$output" | awk '/^__NET__/ {print; exit}')"
-    status_text="$(printf '%s\n' "$output" | awk 'BEGIN{skip=0} /^__NET__/ {skip=1; next} {print}')"
+    cfg_line="$(printf '%s\n' "$output" | awk '/^__CFG__/ {print; exit}')"
+    status_text="$(printf '%s\n' "$output" | awk 'BEGIN{skip=0} /^__NET__/ {skip=1; next} /^__CFG__/ {next} {print}')"
 
     host_name="$(extract_field "$net_line" "host")"
     [[ "$host_name" =~ ^[[:alnum:]_.-]+$ ]] || host_name="$host"
+    target_host="$(extract_field "$cfg_line" "target")"
+    [[ "$target_host" =~ ^[[:alnum:]_.:-]+$ ]] || target_host="-"
 
     vm_rows="$(
       printf '%s\n' "$status_text" \
@@ -368,6 +551,10 @@ print_once() {
                 vm = $2
                 pl = $3
                 if (is_vm_name(vm) && is_pipe_lock(pl)) {
+                  if (!(vm in seen)) {
+                    seen[vm] = 1
+                    order[++n] = vm
+                  }
                   row = $2
                   for (i = 3; i <= NF; i++) row = row "|" $i
                   rows[vm] = row
@@ -381,24 +568,40 @@ print_once() {
                 vm = $1
                 pl = $2
                 if (is_vm_name(vm) && is_pipe_lock(pl)) {
+                  if (!(vm in seen)) {
+                    seen[vm] = 1
+                    order[++n] = vm
+                  }
                   rows[vm] = $0
                 }
               }
             }
             END {
-              for (k in rows) print rows[k]
+              for (i = 1; i <= n; i++) print rows[order[i]]
             }
-          ' | sort
+          '
     )"
 
     if [[ -n "$vm_rows" ]]; then
       while IFS= read -r line; do
         [[ -z "$line" ]] && continue
+        if [[ "$SHOW_ALL" != "true" ]]; then
+          if ! row_is_recent "$line" "$since_ts"; then
+            continue
+          fi
+        fi
         row_hosts+=("$host_name")
+        row_targets+=("$target_host")
         row_lines+=("$line")
+        row_host_indexes+=("$host_idx")
+        row_start_keys+=("$(row_start_key "$line")")
         len="${#host_name}"
         if (( len > host_w )); then
           host_w="$len"
+        fi
+        len="${#target_host}"
+        if (( len > target_w )); then
+          target_w="$len"
         fi
         any_vm="1"
       done <<< "$vm_rows"
@@ -411,9 +614,12 @@ print_once() {
     return
   fi
 
-  printf "%-${host_w}s|VM|PIPE_LOCK|PIPE|START_TIME|LAST_UPDATE|STATE\n" "HOST"
+  sort_rows_if_needed row_hosts row_targets row_lines row_host_indexes row_start_keys
+
+  printf "NO|%-${host_w}s|%-${target_w}s|VM|PIPE_LOCK|PIPE|START_TIME|LAST_UPDATE|STATE\n" "HOST" "TARGET_HOST"
   for (( i=0; i<${#row_hosts[@]}; i++ )); do
-    printf "%-${host_w}s|%s\n" "${row_hosts[$i]}" "${row_lines[$i]}"
+    printf "%d|%-${host_w}s|%-${target_w}s|%s\n" "$no" "${row_hosts[$i]}" "${row_targets[$i]}" "${row_lines[$i]}"
+    no=$((no + 1))
   done
 }
 
@@ -435,6 +641,16 @@ while [[ $# -gt 0 ]]; do
       WATCH_SEC="$1"
       shift
       ;;
+    --sort=*)
+      SORT_MODE="$(normalize_sort_mode "${1#*=}")"
+      shift
+      ;;
+    --sort)
+      shift
+      [[ $# -gt 0 ]] || usage
+      SORT_MODE="$(normalize_sort_mode "$1")"
+      shift
+      ;;
     --reset-status)
       RESET_STATUS_MODE="true"
       shift
@@ -442,6 +658,15 @@ while [[ $# -gt 0 ]]; do
     --reset-only)
       RESET_STATUS_MODE="true"
       RESET_STATUS_ONLY="true"
+      shift
+      ;;
+    --reset-purge)
+      RESET_STATUS_MODE="true"
+      RESET_PURGE_LOGS="true"
+      shift
+      ;;
+    --all)
+      SHOW_ALL="true"
       shift
       ;;
     --iface)
@@ -481,6 +706,7 @@ if [[ "$WATCH" == "true" ]]; then
     print_once
     RESET_STATUS_MODE="false"
     RESET_STATUS_ONLY="false"
+    RESET_PURGE_LOGS="false"
     sleep "$WATCH_SEC"
   done
 else

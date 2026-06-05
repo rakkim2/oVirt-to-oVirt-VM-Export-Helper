@@ -1,5 +1,8 @@
 # oVirt VM Export/Import Thread Bugfix Log (핵심 요약판)
 
+> 개발 이력/개선 내용 보고용 문서는 `DEV.md`를 우선 사용하세요.  
+> 이 문서는 원본 장애 로그 히스토리 보관용입니다.
+
 작성일: 2026-03-07  
 범위: 초기 스레드 로그 + 현재 스레드 로그 병합본(운영 영향이 큰 항목만 유지)
 
@@ -40,7 +43,7 @@
 | C-08 | import 단계가 소스 호스트에서 실행됨 | RHV direct import 실패 가능 | pipeline에서 target 원격 실행으로 변경 + precheck 강제 | 해결 |
 | O-01 | LV up/down 멱등성 부족 | 재실행 시 실패/중단 | active 상태 처리, down retry/권한 검증 강화 | 해결 |
 | O-02 | 동일 VM 중복 실행 | 데이터/락 충돌 위험 | VM lock 도입 + stale lock 자동 정리 | 해결 |
-| O-03 | nohup 종료 불편 | 운영자가 수동 kill 절차 부담 | `run_qemu_ova_pipeline.sh --stop <vm>` 추가(트리 종료) | 해결 |
+| O-03 | nohup 종료 불편 | 운영자가 수동 kill 절차 부담 | `run_virtshift.sh --stop <vm>` 추가(트리 종료) | 해결 |
 | O-04 | 단계별 로그 가시성 부족 | 원인 분리 어려움 | 모든 주요 스크립트에 실행 명령/rc/경로 로그 강화 | 해결 |
 | O-05 | 실패 시 원인 추적 지연 | 장애 분석 시간 증가 | pipeline 실패 시 최신 스크립트/qemu 로그 tail 자동 덤프 | 해결 |
 
@@ -49,12 +52,12 @@
 ### 기본 실행
 ```bash
 bash make_v2v_xml.sh <VM_NAME>
-bash run_qemu_ova_pipeline.sh /data/xml/<VM_NAME>.xml
+bash run_virtshift.sh /data/xml/<VM_NAME>.xml
 ```
 
 ### 중지 (편의)
 ```bash
-bash run_qemu_ova_pipeline.sh --stop <VM_NAME>
+bash run_virtshift.sh --stop <VM_NAME>
 ```
 
 ### 중요 옵션 (현재)

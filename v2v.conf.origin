@@ -45,7 +45,7 @@ IMPORT_TO_RHV="true"
 # VIRTIOSCSITOVIRTIO_CHANGE="false"   # default false: keep source scsi bus
 # INCLUDE_NETWORK="true"
 
-# [run_qemu_ova_pipeline.sh]
+# [run_virtshift.sh]
 # PIPELINE_LOG_ENABLE="1"
 # BUILD_OVA="true"
 # IMPORT_TO_RHV="false"
@@ -67,7 +67,7 @@ IMPORT_TO_RHV="true"
 # RHV_CAFILE="/root/ca.pem"              # optional. leave commented if not used
 # RHV_CLUSTER_DEFAULT=""
 # RHV_STORAGE_DEFAULT=""
-# RHV_DIRECT="false"
+# RHV_DIRECT="true"
 # V2V_OUTPUT_FORMAT="raw"
 # V2V_OUTPUT_ALLOCATION="preallocated"
 # V2V_VERBOSE="true"

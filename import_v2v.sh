@@ -123,11 +123,14 @@ stop_import_vm() {
     if [[ ! -d "$lock_dir" ]]; then
       echo "info: no import lock found for vm=${vm_name} under ${IMPORT_LOCK_BASE_DIR}" >&2
       rm -f "$legacy_pid_file" >/dev/null 2>&1 || true
+    else
+      echo "warn: import lock exists but pid missing: ${lock_dir}" >&2
+      rm -rf "$lock_dir" >/dev/null 2>&1 || true
+      rm -f "$legacy_pid_file" >/dev/null 2>&1 || true
+    fi
+    if stop_import_vm_fallback_scan "$vm_name"; then
       return 0
     fi
-    echo "warn: import lock exists but pid missing: ${lock_dir}" >&2
-    rm -rf "$lock_dir" >/dev/null 2>&1 || true
-    rm -f "$legacy_pid_file" >/dev/null 2>&1 || true
     return 0
   fi
 
@@ -135,6 +138,9 @@ stop_import_vm() {
     echo "warn: stale import pid for vm=${vm_name}: pid=${pid}" >&2
     rm -rf "$lock_dir" >/dev/null 2>&1 || true
     rm -f "$legacy_pid_file" >/dev/null 2>&1 || true
+    if stop_import_vm_fallback_scan "$vm_name"; then
+      return 0
+    fi
     return 0
   fi
 
@@ -157,6 +163,58 @@ stop_import_vm() {
   rm -f "$legacy_pid_file" >/dev/null 2>&1 || true
   log "DONE stop import vm=${vm_name}"
   return 0
+}
+
+find_import_pids_by_vm() {
+  local vm_name="$1"
+  local vm_esc=""
+
+  vm_esc="$(printf '%s' "$vm_name" | sed 's/[][(){}.^$*+?|\\/]/\\&/g')"
+  ps -eo pid=,args= 2>/dev/null \
+    | awk -v vm="$vm_esc" '
+        BEGIN { IGNORECASE = 1 }
+        {
+          pid = $1
+          if (pid !~ /^[0-9]+$/) next
+          line = $0
+          if (line ~ /(import_v2v\.sh|virt-v2v)/ && line ~ vm) {
+            print pid
+          }
+        }
+      ' \
+    | awk '!seen[$0]++'
+}
+
+stop_import_vm_fallback_scan() {
+  local vm_name="$1"
+  local pid=""
+  local found=0
+
+  while IFS= read -r pid; do
+    [[ -z "$pid" ]] && continue
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    if [[ "$pid" == "$$" || "$pid" == "${BASHPID:-}" ]]; then
+      continue
+    fi
+    if ! is_pid_alive "$pid"; then
+      continue
+    fi
+
+    found=1
+    log "cmd stop-scan: TERM process tree pid=${pid} (vm=${vm_name})"
+    kill_pid_tree "$pid" TERM
+    if ! wait_pid_exit "$pid" "$IMPORT_STOP_WAIT_SECONDS"; then
+      log "cmd stop-scan: KILL process tree pid=${pid} (vm=${vm_name})"
+      kill_pid_tree "$pid" KILL
+      sleep 1
+    fi
+  done < <(find_import_pids_by_vm "$vm_name")
+
+  if (( found == 1 )); then
+    log "DONE stop-scan vm=${vm_name}"
+    return 0
+  fi
+  return 1
 }
 
 lock_holder_pid() {
@@ -502,6 +560,7 @@ usage() {
 usage:
   import_v2v.sh --stop <vm-name>
   import_v2v.sh --run-location=remote --stop <vm-name>
+  import_v2v.sh --run-location=targetspm --stop <vm-name>
   import_v2v.sh --run-location=targetspm <vm-name> [csv-path]
   import_v2v.sh --run-location=targetspm --check <vm-name> [csv-path]
   import_v2v.sh --run-location=remote <vm-name> [csv-path]
@@ -539,6 +598,7 @@ Required RHV options (set in v2v.conf):
 
 Modes:
   - stop         : terminate running import process tree for vm and cleanup lock
+                   (default: no run-location => local + remote target if configured)
   - run          : precheck + actual import (default)
   - check        : precheck only (dry-run style), no import execution
   - run-location : required in run/check mode. must be targetspm or remote
@@ -548,6 +608,7 @@ EOF
 
 MODE="run"
 RUN_LOCATION=""
+RUN_LOCATION_EXPLICIT="0"
 STOP_VM_INPUT=""
 while [[ $# -gt 0 ]]; do
   case "${1:-}" in
@@ -573,6 +634,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     --run-location=*)
       RUN_LOCATION="$(normalize_run_location "${1#*=}")"
+      RUN_LOCATION_EXPLICIT="1"
       shift
       ;;
     --run-location)
@@ -581,6 +643,7 @@ while [[ $# -gt 0 ]]; do
         usage
       fi
       RUN_LOCATION="$(normalize_run_location "$2")"
+      RUN_LOCATION_EXPLICIT="1"
       shift 2
       ;;
     --*)
@@ -694,7 +757,7 @@ RHV_PASS_FILE="${RHV_PASS_FILE:-}"
 RHV_CAFILE="${RHV_CAFILE:-}"
 RHV_CLUSTER_DEFAULT="${RHV_CLUSTER_DEFAULT:-}"
 RHV_STORAGE_DEFAULT="${RHV_STORAGE_DEFAULT:-}"
-RHV_DIRECT="$(normalize_bool "${RHV_DIRECT:-false}")" || exit 1
+RHV_DIRECT="$(normalize_bool "${RHV_DIRECT:-true}")" || exit 1
 REMOTE_TARGET_HOST="${REMOTE_TARGET_HOST:-}"
 REMOTE_TARGET_USER="${REMOTE_TARGET_USER:-root}"
 REMOTE_SSH_PORT="${REMOTE_SSH_PORT:-22}"
@@ -803,7 +866,13 @@ if [[ -n "$RUN_LOG_DIR" ]]; then
   LOG_DIR="$RUN_LOG_DIR"
 fi
 LOG_FILE="${LOG_DIR%/}/import_v2v-$(date +%F_%H%M%S).log"
+LOG_CURRENT_LINK="${LOG_DIR%/}/import_v2v-current.log"
+LOG_ACCUM_FILE="${LOG_DIR%/}/import_v2v.log"
 LOCK_DIR="${IMPORT_LOCK_BASE_DIR%/}/${VM_NAME}.lock"
+
+mkdir -p "$LOG_DIR"
+touch "$LOG_ACCUM_FILE"
+ln -sfn "$LOG_FILE" "$LOG_CURRENT_LINK" >/dev/null 2>&1 || true
 
 if [[ ! "$IMPORT_STOP_WAIT_SECONDS" =~ ^[0-9]+$ ]] || (( IMPORT_STOP_WAIT_SECONDS < 1 )); then
   echo "error: IMPORT_STOP_WAIT_SECONDS must be integer >= 1 (current: $IMPORT_STOP_WAIT_SECONDS)" >&2
@@ -811,10 +880,9 @@ if [[ ! "$IMPORT_STOP_WAIT_SECONDS" =~ ^[0-9]+$ ]] || (( IMPORT_STOP_WAIT_SECOND
 fi
 
 if [[ "$MODE" == "stop" ]]; then
-  if [[ "$REMOTE_MODE" == "true" ]]; then
-    mkdir -p "$LOG_DIR"
+  if [[ "$RUN_LOCATION_EXPLICIT" == "1" && "$REMOTE_MODE" == "true" ]]; then
     if [[ "$IMPORT_V2V_LOG_ENABLE" == "true" ]]; then
-      exec > >(tee -a "$LOG_FILE") 2>&1
+      exec > >(tee -a "$LOG_FILE" "$LOG_ACCUM_FILE") 2>&1
     fi
     log "START import_v2v vm=${VM_NAME} mode=stop run-location=remote config=${CONF_SOURCE}"
     if run_remote_import "$CSV_PATH"; then
@@ -826,8 +894,35 @@ if [[ "$MODE" == "stop" ]]; then
       exit "$rc"
     fi
   fi
-  stop_import_vm "$VM_NAME"
-  exit $?
+
+  if [[ "$RUN_LOCATION_EXPLICIT" == "1" && "$RUN_LOCATION" == "targetspm" ]]; then
+    stop_import_vm "$VM_NAME"
+    exit $?
+  fi
+
+  # Default stop behavior (no --run-location):
+  # try local first, then remote target (if configured) so remote-running imports
+  # are not missed.
+  stop_rc=0
+  if ! stop_import_vm "$VM_NAME"; then
+    stop_rc=$?
+  fi
+
+  if [[ -n "$REMOTE_TARGET_HOST" ]]; then
+    if [[ "$IMPORT_V2V_LOG_ENABLE" == "true" ]]; then
+      exec > >(tee -a "$LOG_FILE" "$LOG_ACCUM_FILE") 2>&1
+    fi
+    log "START import_v2v vm=${VM_NAME} mode=stop run-location=auto(remote)"
+    if run_remote_import "$CSV_PATH"; then
+      log "DONE import_v2v vm=${VM_NAME} mode=stop run-location=auto(remote)"
+    else
+      rc=$?
+      log "FAIL import_v2v vm=${VM_NAME} mode=stop run-location=auto(remote) rc=${rc}"
+      stop_rc=$rc
+    fi
+  fi
+
+  exit "$stop_rc"
 fi
 
 if [[ ! "$ENGINE_CONNECT_TIMEOUT" =~ ^[0-9]+$ ]] || (( ENGINE_CONNECT_TIMEOUT < 1 )); then
@@ -836,9 +931,8 @@ if [[ ! "$ENGINE_CONNECT_TIMEOUT" =~ ^[0-9]+$ ]] || (( ENGINE_CONNECT_TIMEOUT < 
 fi
 
 if [[ "$REMOTE_MODE" == "true" ]]; then
-  mkdir -p "$LOG_DIR"
   if [[ "$IMPORT_V2V_LOG_ENABLE" == "true" ]]; then
-    exec > >(tee -a "$LOG_FILE") 2>&1
+    exec > >(tee -a "$LOG_FILE" "$LOG_ACCUM_FILE") 2>&1
   fi
   log "START import_v2v vm=${VM_NAME} config=${CONF_SOURCE}"
   if [[ "$IMPORT_V2V_LOG_ENABLE" == "true" ]]; then
@@ -900,14 +994,15 @@ finish_import() {
   exit "$rc"
 }
 
-mkdir -p "$LOG_DIR"
 if [[ "$IMPORT_V2V_LOG_ENABLE" == "true" ]]; then
-  exec > >(tee -a "$LOG_FILE") 2>&1
+  exec > >(tee -a "$LOG_FILE" "$LOG_ACCUM_FILE") 2>&1
 fi
 
 log "START import_v2v vm=${VM_NAME} config=${CONF_SOURCE}"
 if [[ "$IMPORT_V2V_LOG_ENABLE" == "true" ]]; then
   log "script log   : $LOG_FILE"
+  log "script cur   : $LOG_CURRENT_LINK"
+  log "script all   : $LOG_ACCUM_FILE"
 fi
 log "mode         : ${MODE}"
 log "run location : ${RUN_LOCATION}"

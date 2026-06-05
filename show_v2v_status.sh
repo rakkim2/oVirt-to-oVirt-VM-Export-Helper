@@ -71,8 +71,8 @@ pipeline_stage() {
   stage="$(
     awk '
       {
-        if ($0 ~ /FAIL run_qemu_ova_pipeline/)      s="failed";
-        if ($0 ~ /DONE run_qemu_ova_pipeline/)      s="done";
+        if ($0 ~ /FAIL run_virtshift/)      s="failed";
+        if ($0 ~ /DONE run_virtshift/)      s="done";
         if ($0 ~ /\] activate lv$/)                 s="lv-up";
         if ($0 ~ /\] convert disks \(parallel\)$/)  s="convert";
         if ($0 ~ /\] build ova$/)                   s="build-ova";
@@ -134,35 +134,84 @@ latest_percent_from_log() {
   echo "$pct"
 }
 
+latest_import_disk_from_log() {
+  local file="$1"
+  local tail_text=""
+  local disk_pair=""
+
+  [[ -f "$file" ]] || { echo ""; return; }
+  tail_text="$(tail -c 2097152 "$file" 2>/dev/null | tr '\r' '\n' || true)"
+
+  disk_pair="$(
+    printf '%s' "$tail_text" \
+      | awk '
+          {
+            if (match($0, /[Cc]opying disk[[:space:]]+([0-9]+)\/([0-9]+)/, m)) {
+              d = m[1] "/" m[2]
+            }
+          }
+          END { if (d != "") print d }
+        ' \
+      || true
+  )"
+
+  echo "$disk_pair"
+}
+
+latest_import_progress_label() {
+  local file="$1"
+  local disk_pair=""
+  local pct=""
+
+  [[ -f "$file" ]] || { echo ""; return; }
+  disk_pair="$(latest_import_disk_from_log "$file")"
+  pct="$(latest_percent_from_log "$file")"
+
+  if [[ -n "$disk_pair" && -n "$pct" ]]; then
+    echo "disk ${disk_pair}, ${pct}%"
+    return
+  fi
+  if [[ -n "$disk_pair" ]]; then
+    echo "disk ${disk_pair}"
+    return
+  fi
+  if [[ -n "$pct" ]]; then
+    echo "${pct}%"
+    return
+  fi
+
+  echo ""
+}
+
 import_summary() {
   local file="$1"
   local stage="$2"
-  local pct=""
+  local progress=""
 
   [[ -f "$file" ]] || { echo "$stage"; return; }
-  pct="$(latest_percent_from_log "$file")"
+  progress="$(latest_import_progress_label "$file")"
 
   case "$stage" in
     done)
       echo "done(100.00%)"
       ;;
     failed)
-      if [[ -n "$pct" ]]; then
-        echo "failed(${pct}%)"
+      if [[ -n "$progress" ]]; then
+        echo "failed(${progress})"
       else
         echo "failed"
       fi
       ;;
     -)
-      if [[ -n "$pct" ]]; then
-        echo "running(${pct}%)"
+      if [[ -n "$progress" ]]; then
+        echo "running(${progress})"
       else
         echo "-"
       fi
       ;;
     *)
-      if [[ -n "$pct" ]]; then
-        echo "${stage}(${pct}%)"
+      if [[ -n "$progress" ]]; then
+        echo "${stage}(${progress})"
       else
         echo "$stage"
       fi

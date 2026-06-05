@@ -17,10 +17,10 @@
 cd /data/script
 
 # 1) 전체 실행 (convert + remote import)
-bash run_qemu_ova_pipeline.sh <VM_NAME>
+bash run_virtshift.sh <VM_NAME>
 
 # 2) 중지
-bash run_qemu_ova_pipeline.sh --stop <VM_NAME>
+bash run_virtshift.sh --stop <VM_NAME>
 
 # 3) import만 단독 실행 (remote)
 bash import_v2v.sh --run-location=remote <VM_NAME>

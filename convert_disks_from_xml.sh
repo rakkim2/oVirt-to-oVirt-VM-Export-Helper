@@ -15,7 +15,7 @@ if [[ -z "${CONFIG_FILE:-}" ]]; then
 fi
 declare -a PRESERVE_ENV_KEYS=(
   DATA_BASE_DIR V2V_BASE_DIR V2V_LOG_BASE_DIR QEMU_BASE_DIR RAW_BASE_DIR
-  MAX_JOBS INPUT_FORMAT OUTPUT_FORMAT OUTPUT_OPTIONS SPARSE_SIZE
+  INPUT_FORMAT OUTPUT_FORMAT OUTPUT_OPTIONS SPARSE_SIZE
   COROUTINES CACHE_MODE SRC_CACHE_MODE SCRIPT_LOG_ENABLE CONVERT_LOG_ENABLE
   PROGRESS_INTERVAL RUN_LOG_DIR
 )
@@ -110,15 +110,21 @@ else
   SCRIPT_LOG_DIR="${V2V_LOG_BASE_DIR%/}/${vm_name}"
 fi
 SCRIPT_LOG_FILE="${SCRIPT_LOG_DIR%/}/convert_disks_from_xml-$(date +%F_%H%M%S).log"
+SCRIPT_LOG_CURRENT_LINK="${SCRIPT_LOG_DIR%/}/convert_disks_from_xml-current.log"
+SCRIPT_LOG_ACCUM_FILE="${SCRIPT_LOG_DIR%/}/convert_disks_from_xml.log"
 
 mkdir -p "$OUT_DIR" "$LOG_DIR" "$SCRIPT_LOG_DIR"
+touch "$SCRIPT_LOG_ACCUM_FILE"
+ln -sfn "$SCRIPT_LOG_FILE" "$SCRIPT_LOG_CURRENT_LINK" >/dev/null 2>&1 || true
 if is_enabled "$CONVERT_LOG_ENABLE"; then
-  exec > >(tee -a "$SCRIPT_LOG_FILE") 2>&1
+  exec > >(tee -a "$SCRIPT_LOG_FILE" "$SCRIPT_LOG_ACCUM_FILE") 2>&1
 fi
 
 log "START convert_disks_from_xml xml=${XML_PATH} vm=${vm_name} config=${CONF_SOURCE}"
 if is_enabled "$CONVERT_LOG_ENABLE"; then
   log "script log : $SCRIPT_LOG_FILE"
+  log "script cur : $SCRIPT_LOG_CURRENT_LINK"
+  log "script all : $SCRIPT_LOG_ACCUM_FILE"
 fi
 
 disk_lines=$(

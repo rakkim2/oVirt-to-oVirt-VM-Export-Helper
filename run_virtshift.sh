@@ -270,8 +270,8 @@ usage() {
   local rc="${1:-1}"
   cat >&2 <<'EOF'
 usage:
-  run_qemu_ova_pipeline.sh <vm-name|vm-xml>
-  run_qemu_ova_pipeline.sh --stop <vm-name>
+  run_virtshift.sh <vm-name|vm-xml>
+  run_virtshift.sh --stop <vm-name>
 
 Pipeline:
   1) toggle_lv_from_xml.sh up
@@ -299,6 +299,8 @@ Inputs:
   - VM_LOCK_BASE_DIR (default: ${V2V_BASE_DIR}/locks)
   - VM log dir: /data/v2v_log/<vm>/
     - pipeline log     : pipeline_<YYYY-mm-dd_HHMMSS>.log
+    - pipeline current : pipeline-current.log (symlink to latest run log)
+    - pipeline accum   : pipeline.log (append across runs)
   - Status board log (global only):
     - /data/v2v_log/status_board.log
   - Result logs:
@@ -390,6 +392,7 @@ IMPORT_LOCK_BASE_DIR="${IMPORT_LOCK_BASE_DIR:-${V2V_BASE_DIR%/}/locks/import_v2v
 FAILURE_TAIL_LINES="${FAILURE_TAIL_LINES:-120}"
 FAILURE_QEMU_LOG_COUNT="${FAILURE_QEMU_LOG_COUNT:-3}"
 STOP_WAIT_SECONDS="${STOP_WAIT_SECONDS:-10}"
+MAX_JOBS="${MAX_JOBS:-}"
 
 if ! is_non_negative_int "$FAILURE_TAIL_LINES"; then
   echo "error: FAILURE_TAIL_LINES must be integer >= 0 (current: $FAILURE_TAIL_LINES)" >&2
@@ -458,6 +461,8 @@ RUN_ID="${RUN_ID:-$(date +%F_%H%M%S)}"
 RUN_LOG_DIR="${RUN_LOG_DIR:-${VM_LOG_BASE_DIR%/}}"
 PIPELINE_LOG_DIR="$RUN_LOG_DIR"
 PIPELINE_LOG_FILE="${PIPELINE_LOG_DIR%/}/pipeline_${RUN_ID}.log"
+PIPELINE_CURRENT_LOG_LINK="${VM_LOG_BASE_DIR%/}/pipeline-current.log"
+PIPELINE_ACCUM_LOG_FILE="${VM_LOG_BASE_DIR%/}/pipeline.log"
 STATUS_BOARD_GLOBAL_LOG_FILE="${V2V_LOG_BASE_DIR%/}/status_board.log"
 RESULT_VM_LOG_FILE="${VM_LOG_BASE_DIR%/}/result-${RUN_ID}.log"
 RESULT_GLOBAL_LOG_FILE="${V2V_LOG_BASE_DIR%/}/result.log"
@@ -471,7 +476,8 @@ FAIL_REASON=""
 CURRENT_STEP="init"
 
 mkdir -p "$PIPELINE_LOG_DIR" "$VM_LOG_BASE_DIR" "${V2V_LOG_BASE_DIR%/}"
-touch "$STATUS_BOARD_GLOBAL_LOG_FILE" "$RESULT_VM_LOG_FILE" "$RESULT_GLOBAL_LOG_FILE"
+touch "$STATUS_BOARD_GLOBAL_LOG_FILE" "$RESULT_VM_LOG_FILE" "$RESULT_GLOBAL_LOG_FILE" "$PIPELINE_ACCUM_LOG_FILE"
+ln -sfn "$PIPELINE_LOG_FILE" "$PIPELINE_CURRENT_LOG_LINK" >/dev/null 2>&1 || true
 
 lock_holder_pid() {
   if [[ -f "$VM_LOCK_PID_FILE" ]]; then
@@ -598,7 +604,7 @@ fi
 trap release_vm_lock EXIT
 
 if [[ "$PIPELINE_LOG_ENABLE" == "1" ]]; then
-  exec > >(tee -a "$PIPELINE_LOG_FILE") 2>&1
+  exec > >(tee -a "$PIPELINE_LOG_FILE" "$PIPELINE_ACCUM_LOG_FILE") 2>&1
 fi
 
 IMG_DIR="${QEMU_VM_DIR%/}"
@@ -606,9 +612,11 @@ OVA_PATH="${OVA_OUTPUT_DIR%/}/${VM_NAME}.ova"
 
 mkdir -p "$IMG_DIR"
 
-log "START run_qemu_ova_pipeline xml=${XML_PATH} config=${CONF_SOURCE}"
+log "START run_virtshift xml=${XML_PATH} config=${CONF_SOURCE}"
 if [[ "$PIPELINE_LOG_ENABLE" == "1" ]]; then
   log "pipeline log : $PIPELINE_LOG_FILE"
+  log "pipeline cur : $PIPELINE_CURRENT_LOG_LINK"
+  log "pipeline all : $PIPELINE_ACCUM_LOG_FILE"
 fi
 if v2v_preserved_var_is_set "IMPORT_TO_RHV"; then
   log "info         : IMPORT_TO_RHV overridden by env -> ${IMPORT_TO_RHV}"
@@ -742,7 +750,7 @@ finish_pipeline() {
 
   if (( rc == 0 )); then
     summary_reason="pipeline completed"
-    log "DONE run_qemu_ova_pipeline"
+    log "DONE run_virtshift"
     log "xml : $XML_PATH"
     if [[ "$IMPORT_TO_RHV" == "true" ]]; then
       log "import : done on target (${REMOTE_TARGET_USER}@${REMOTE_TARGET_HOST})"
@@ -763,7 +771,7 @@ finish_pipeline() {
     else
       summary_reason="${CURRENT_STEP} failed"
     fi
-    log "FAIL run_qemu_ova_pipeline rc=${rc}"
+    log "FAIL run_virtshift rc=${rc}"
     log "collecting failure context tails..."
     dump_failure_context
   fi
@@ -798,8 +806,10 @@ append_status_board_snapshot "after-lv-up"
 
 CURRENT_STEP="convert"
 log "${STEP_CONVERT} convert disks (parallel)"
-log "cmd         : QEMU_BASE_DIR=${QEMU_BASE_DIR} V2V_LOG_BASE_DIR=${V2V_LOG_BASE_DIR} bash ${SCRIPT_DIR}/convert_disks_from_xml.sh ${XML_PATH}"
-if QEMU_BASE_DIR="$QEMU_BASE_DIR" \
+log "cmd         : CONFIG_FILE=${CONFIG_FILE} MAX_JOBS=${MAX_JOBS:-<auto>} QEMU_BASE_DIR=${QEMU_BASE_DIR} V2V_LOG_BASE_DIR=${V2V_LOG_BASE_DIR} bash ${SCRIPT_DIR}/convert_disks_from_xml.sh ${XML_PATH}"
+if CONFIG_FILE="$CONFIG_FILE" \
+  MAX_JOBS="$MAX_JOBS" \
+  QEMU_BASE_DIR="$QEMU_BASE_DIR" \
   V2V_LOG_BASE_DIR="$V2V_LOG_BASE_DIR" \
   RUN_LOG_DIR="$RUN_LOG_DIR" \
   bash "${SCRIPT_DIR}/convert_disks_from_xml.sh" "$XML_PATH"
